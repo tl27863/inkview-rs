@@ -17,7 +17,6 @@ const SCALE_FACTOR: f32 = 3.0;
 /// Damage larger than this is treated as a full UI transition (a card or the
 /// loading screen), not an animation. Such regions must not use DynamicUpdate.
 const LARGE_DAMAGE_AREA: i32 = 20_000;
-const EINK_TRACE: bool = true;
 
 #[repr(transparent)]
 #[derive(Clone, Copy)]
@@ -150,12 +149,6 @@ impl slint::platform::Platform for Backend {
                             // The panel is still busy. Keep the pending region
                             // instead of dropping the final frame; retry shortly.
                             dynamic_finalize_retries += 1;
-                            if EINK_TRACE && dynamic_finalize_retries % 50 == 1 {
-                                eprintln!(
-                                    "[eink] finalize waiting: retry={} region={:?}",
-                                    dynamic_finalize_retries, redraw_region
-                                );
-                            }
                             if dynamic_finalize_retries > 100 {
                                 // The panel appears stuck; recover with a full
                                 // refresh from the current framebuffer.
@@ -174,9 +167,6 @@ impl slint::platform::Platform for Backend {
                                     Some(Instant::now() + Duration::from_millis(20));
                             }
                         } else {
-                            if EINK_TRACE {
-                                eprintln!("[eink] finalize partial: region={:?}", redraw_region);
-                            }
                             dynamic_region_to_redraw = None;
                             accumulated_updates = None;
                             fulfill_dynamic_updates_after = None;
@@ -219,7 +209,6 @@ impl slint::platform::Platform for Backend {
                     // println!("Drawing to: {:?}", damage);
 
                     let damage_rect = rect_from_phys(damage.clone());
-                    let damage_area = damage_rect.width() * damage_rect.height();
 
                     if screen.is_updating() {
                         if let Some(r) = accumulated_updates.as_mut() {
@@ -233,20 +222,10 @@ impl slint::platform::Platform for Backend {
                             .map(|r| r.width() * r.height())
                             .unwrap_or(0);
 
-                        if EINK_TRACE {
-                            eprintln!(
-                                "[eink] draw: updating area={damage_area} accumulated={accumulated_area} elapsed={:?}",
-                                last_draw_at.elapsed()
-                            );
-                        }
-
                         if accumulated_area <= LARGE_DAMAGE_AREA
                             && last_draw_at.elapsed() > Duration::from_millis(20)
                         {
                             let redraw_region = accumulated_updates.take().unwrap();
-                            if EINK_TRACE {
-                                eprintln!("[eink] dynamic update: region={redraw_region:?}");
-                            }
                             screen.dynamic_update(
                                 redraw_region.origin.x,
                                 redraw_region.origin.y,
@@ -254,10 +233,6 @@ impl slint::platform::Platform for Backend {
                                 redraw_region.height() as u32,
                             );
                             last_draw_at = Instant::now();
-                        } else if EINK_TRACE {
-                            eprintln!(
-                                "[eink] deferring large update: accumulated={accumulated_area}"
-                            );
                         }
 
                         if let Some(r) = dynamic_region_to_redraw.as_mut() {
@@ -269,9 +244,6 @@ impl slint::platform::Platform for Backend {
                         fulfill_dynamic_updates_after =
                             Some(Instant::now() + Duration::from_millis(200));
                     } else {
-                        if EINK_TRACE {
-                            eprintln!("[eink] draw: partial area={damage_area}");
-                        }
                         accumulated_updates = None;
                         screen.partial_update(
                             damage.bounding_box_origin().x,
