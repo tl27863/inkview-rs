@@ -104,6 +104,7 @@ impl slint::platform::Platform for Backend {
         let mut fulfill_dynamic_updates_after: Option<Instant> = None;
         let mut dynamic_region_to_redraw: Option<euclid::Rect<i32, euclid::UnknownUnit>> = None;
         let mut accumulated_updates: Option<euclid::Rect<i32, euclid::UnknownUnit>> = None;
+        let mut dynamic_finalize_retries: u32 = 0;
         let mut last_draw_at = Instant::now();
 
         loop {
@@ -136,17 +137,37 @@ impl slint::platform::Platform for Backend {
 
                 if let Some(redraw_region) = dynamic_region_to_redraw {
                     if last_draw_at.elapsed() > Duration::from_millis(200) {
-                        dynamic_region_to_redraw = None;
-                        fulfill_dynamic_updates_after = None;
-
                         let mut screen = self.screen.borrow_mut();
-                        screen.partial_update(
-                            redraw_region.origin.x,
-                            redraw_region.origin.y,
-                            redraw_region.width() as u32,
-                            redraw_region.height() as u32,
-                        );
-                        last_draw_at = Instant::now();
+
+                        if screen.is_updating() {
+                            // The panel is still busy. Keep the pending region
+                            // instead of dropping the final frame; retry shortly.
+                            dynamic_finalize_retries += 1;
+                            if dynamic_finalize_retries > 100 {
+                                // The panel appears stuck; recover with a full
+                                // refresh from the current framebuffer.
+                                screen.full_update();
+                                dynamic_region_to_redraw = None;
+                                fulfill_dynamic_updates_after = None;
+                                dynamic_finalize_retries = 0;
+                                last_draw_at = Instant::now();
+                            } else {
+                                fulfill_dynamic_updates_after =
+                                    Some(Instant::now() + Duration::from_millis(20));
+                            }
+                        } else {
+                            dynamic_region_to_redraw = None;
+                            fulfill_dynamic_updates_after = None;
+                            dynamic_finalize_retries = 0;
+
+                            screen.partial_update(
+                                redraw_region.origin.x,
+                                redraw_region.origin.y,
+                                redraw_region.width() as u32,
+                                redraw_region.height() as u32,
+                            );
+                            last_draw_at = Instant::now();
+                        }
                     }
                 }
 
