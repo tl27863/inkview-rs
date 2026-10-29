@@ -25,6 +25,12 @@ const LARGE_DAMAGE_AREA: i32 = 20_000;
 /// while the panel reports that it is busy.
 const SHOW_SETTLE: Duration = Duration::from_millis(300);
 
+/// Delay before presenting a large UI transition (loading screen, card, screen
+/// switch). The touch that triggered it can still have a panel update in
+/// flight, and an immediate PartialUpdate may then be discarded. Keep this
+/// shorter than [`SHOW_SETTLE`]: the user is actively interacting.
+const TRANSITION_SETTLE: Duration = Duration::from_millis(200);
+
 #[repr(transparent)]
 #[derive(Clone, Copy)]
 struct GrayScalePixel(u8);
@@ -293,9 +299,22 @@ impl slint::platform::Platform for Backend {
                         eprintln!("[eink] first full frame rendered");
                     }
 
+                    let damage_area = damage_rect.width() * damage_rect.height();
+
                     if full_present_at.is_some() {
                         // The pending full present re-blits and presents the
                         // whole retained frame; skip competing updates here.
+                    } else if damage_area > LARGE_DAMAGE_AREA {
+                        // Do not race the touch/system update that caused this
+                        // transition. The retained frame is up to date; present
+                        // it whole after the panel has settled.
+                        full_present_at = Some(Instant::now() + TRANSITION_SETTLE);
+                        full_present_retries = 0;
+                        accumulated_updates = None;
+                        dynamic_region_to_redraw = None;
+                        fulfill_dynamic_updates_after = None;
+                        dynamic_finalize_retries = 0;
+                        eprintln!("[eink] large transition: full repaint scheduled");
                     } else if screen.is_updating() {
                         if let Some(r) = accumulated_updates.as_mut() {
                             *r = r.union(&damage_rect);
@@ -330,14 +349,8 @@ impl slint::platform::Platform for Backend {
                         fulfill_dynamic_updates_after =
                             Some(Instant::now() + Duration::from_millis(200));
                     } else {
-                        let damage_area = damage_rect.width() * damage_rect.height();
-                        if damage_area > LARGE_DAMAGE_AREA {
-                            // A large transition can follow a previous update
-                            // faster than IsUpdateInProcess() reports it. Wait
-                            // so the loading-to-card update is not discarded.
-                            screen.wait_for_update_complete();
-                        }
-
+                        // Small damage was received while the panel was idle.
+                        // It is safe to present immediately.
                         accumulated_updates = None;
                         screen.partial_update(
                             damage.bounding_box_origin().x,
