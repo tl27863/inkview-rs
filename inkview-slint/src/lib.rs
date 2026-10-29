@@ -18,16 +18,14 @@ const SCALE_FACTOR: f32 = 3.0;
 /// loading screen), not an animation. Such regions must not use DynamicUpdate.
 const LARGE_DAMAGE_AREA: i32 = 20_000;
 
-/// How long to let InkView settle after Show/Foreground/Repaint before
-/// presenting the whole retained frame. The panel can still be updating from a
-/// task switch when the first frame is rendered, so an immediate PartialUpdate
-/// is discarded. This is deliberately short; the full present below is retried
-/// while the panel reports that it is busy.
+/// Delay after the immediate show/resume present before verifying it with a
+/// second full present. The immediate update can be discarded while the task
+/// switch is still in flight; the verification does not delay the first frame.
 const SHOW_SETTLE: Duration = Duration::from_millis(300);
 
-/// Delay before presenting a large UI transition (loading screen, card, screen
-/// switch). The touch that triggered it can still have a panel update in
-/// flight, and an immediate PartialUpdate may then be discarded.
+/// Delay after an immediate large-transition present (loading screen, card,
+/// screen switch) before verifying it. The touch feedback update can otherwise
+/// discard the immediate frame; the verification is the safety net.
 const TRANSITION_SETTLE: Duration = Duration::from_millis(300);
 
 #[repr(transparent)]
@@ -142,12 +140,13 @@ impl slint::platform::Platform for Backend {
         let mut dynamic_finalize_retries: u32 = 0;
         let mut last_draw_at = Instant::now();
 
-        // A full present is delayed after Show/Foreground/Repaint. InkView can
-        // still be updating the panel from the task switch when the first
-        // frame is rendered; an immediate PartialUpdate is then discarded.
-        // Keeping a pending full present and re-blitting the retained frame
-        // makes the first frame (and resume) independent of that race.
-        let mut full_present_at: Option<Instant> = Some(Instant::now() + SHOW_SETTLE);
+        // Present the retained frame immediately after Show/Foreground/Repaint
+        // and after large transitions, then repeat the full present once after
+        // a settle delay. The immediate attempt keeps the UI responsive; the
+        // verification catches a frame that InkView discarded while the task
+        // switch or a touch feedback update was still in flight.
+        let mut full_present_at: Option<Instant> = Some(Instant::now());
+        let mut verify_full_at: Option<Instant> = Some(Instant::now() + SHOW_SETTLE);
         let mut full_present_retries: u32 = 0;
         let mut first_full_render_done = false;
         let mut force_full_render = false;
@@ -157,6 +156,20 @@ impl slint::platform::Platform for Backend {
 
             if let Some(window) = self.window.borrow().clone() {
                 let now = Instant::now();
+
+                if let Some(at) = verify_full_at {
+                    if now >= at {
+                        if full_present_at.is_none() {
+                            full_present_at = Some(now);
+                            full_present_retries = 0;
+                            eprintln!("[eink] verification repaint scheduled");
+                        }
+                        // If the immediate present is still retrying, that
+                        // attempt is the verification; do not queue a second.
+                        verify_full_at = None;
+                    }
+                }
+
                 if full_present_at.is_some_and(|at| now >= at) && !first_full_render_done {
                     // The first present has no complete frame yet. Force one
                     // full render so the re-blit below has valid pixels.
@@ -172,6 +185,7 @@ impl slint::platform::Platform for Backend {
                         fulfill_dynamic_updates_after
                             .map(|i| i.saturating_duration_since(Instant::now())),
                         full_present_at.map(|i| i.saturating_duration_since(Instant::now())),
+                        verify_full_at.map(|i| i.saturating_duration_since(Instant::now())),
                     ]
                     .into_iter()
                     .flatten()
@@ -234,7 +248,8 @@ impl slint::platform::Platform for Backend {
                 if let Some(evt) = evt {
                     match evt {
                         Event::Show | Event::Repaint | Event::Foreground { .. } => {
-                            full_present_at = Some(Instant::now() + SHOW_SETTLE);
+                            full_present_at = Some(Instant::now());
+                            verify_full_at = Some(Instant::now() + SHOW_SETTLE);
                             full_present_retries = 0;
                             // Drop any pending dynamic presentation; the full
                             // present below covers the whole frame.
@@ -243,11 +258,12 @@ impl slint::platform::Platform for Backend {
                             fulfill_dynamic_updates_after = None;
                             dynamic_finalize_retries = 0;
                             window.request_redraw();
-                            eprintln!("[eink] show repaint scheduled");
+                            eprintln!("[eink] show present: immediate + verification scheduled");
                         }
                         Event::Background { .. } | Event::Hide => {
                             // Do not present into a task that is no longer visible.
                             full_present_at = None;
+                            verify_full_at = None;
                             full_present_retries = 0;
                             force_full_render = false;
                         }
@@ -300,20 +316,22 @@ impl slint::platform::Platform for Backend {
 
                     let damage_area = damage_rect.width() * damage_rect.height();
 
-                    if full_present_at.is_some() {
-                        // The pending full present re-blits and presents the
-                        // whole retained frame; skip competing updates here.
-                    } else if damage_area > LARGE_DAMAGE_AREA {
-                        // Do not race the touch/system update that caused this
-                        // transition. The retained frame is up to date; present
-                        // it whole after the panel has settled.
-                        full_present_at = Some(Instant::now() + TRANSITION_SETTLE);
+                    if full_present_at.is_none() && damage_area > LARGE_DAMAGE_AREA {
+                        // Show the new screen immediately, then verify it after
+                        // the touch feedback/system update has settled.
+                        full_present_at = Some(Instant::now());
+                        verify_full_at = Some(Instant::now() + TRANSITION_SETTLE);
                         full_present_retries = 0;
                         accumulated_updates = None;
                         dynamic_region_to_redraw = None;
                         fulfill_dynamic_updates_after = None;
                         dynamic_finalize_retries = 0;
-                        eprintln!("[eink] large transition: full repaint scheduled");
+                        eprintln!("[eink] large transition: immediate + verification scheduled");
+                    }
+
+                    if full_present_at.is_some() {
+                        // The pending full present re-blits and presents the
+                        // whole retained frame; skip competing updates here.
                     } else if screen.is_updating() {
                         if let Some(r) = accumulated_updates.as_mut() {
                             *r = r.union(&damage_rect);
