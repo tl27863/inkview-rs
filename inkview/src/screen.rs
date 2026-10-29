@@ -1,4 +1,4 @@
-use crate::bindings::APPLICATION_ATTRIBUTE_APPLICATION_READER;
+use crate::bindings::{APPLICATION_ATTRIBUTE_APPLICATION_READER, EVT_CUSTOM};
 use crate::error;
 use crate::{bindings::icanvas_s, bindings::Inkview};
 use core::ffi::c_int;
@@ -14,6 +14,7 @@ pub struct Screen<'a> {
     height: usize,
     stride: usize,
     buf: *mut u8,
+    task: c_int,
 }
 
 impl<'a> Screen<'a> {
@@ -21,7 +22,8 @@ impl<'a> Screen<'a> {
         unsafe {
             iv.SetCurrentApplicationAttribute(APPLICATION_ATTRIBUTE_APPLICATION_READER, 1);
         }
-        let fb = unsafe { iv.GetTaskFramebuffer(iv.GetCurrentTask()).as_mut() }
+        let task = unsafe { iv.GetCurrentTask() };
+        let fb = unsafe { iv.GetTaskFramebuffer(task).as_mut() }
             .expect("Failed to get current task framebuffer while creating new screen.");
 
         let width = fb.width as usize;
@@ -36,7 +38,21 @@ impl<'a> Screen<'a> {
             height,
             stride,
             buf,
+            task,
         }
+    }
+
+    /// Posts a no-op `EVT_CUSTOM` to this task's InkView event queue.
+    ///
+    /// Screen updates requested from a thread other than the one running
+    /// `InkViewMain` can sit unprocessed until that loop wakes up, which may
+    /// only happen on the next input event. Posting an event wakes it. The
+    /// event is not mapped by `Event::from_raw`, so it is never forwarded.
+    ///
+    /// Returns `SendEventTo`'s result, or `None` if the symbol is missing.
+    pub fn wake_event_loop(&self) -> Option<c_int> {
+        let send = self.iv.SendEventTo.as_ref().ok()?;
+        Some(unsafe { send(self.task, EVT_CUSTOM as c_int, 0, 0) })
     }
 
     pub fn clear(&mut self) {

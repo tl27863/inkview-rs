@@ -5,7 +5,7 @@ use slint::platform::{
     WindowEvent,
 };
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     rc::Rc,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -264,6 +264,7 @@ pub struct Backend {
     window: RefCell<Option<Rc<renderer::MinimalSoftwareWindow>>>,
     buffer: RefCell<Vec<Gray8>>,
     trace_events: bool,
+    wake_logged: Cell<bool>,
 }
 
 impl Backend {
@@ -288,6 +289,20 @@ impl Backend {
             window: Default::default(),
             buffer: buffer.into(),
             trace_events,
+            wake_logged: Cell::new(false),
+        }
+    }
+
+    /// Wakes InkView's main loop after a screen update.
+    ///
+    /// Updates are requested from the Slint thread while `InkViewMain` runs on
+    /// the main thread. On the PB710 an update could stay unprocessed (panel
+    /// reported idle after ~100 ms, nothing drawn) until the next touch woke
+    /// that loop. See `Screen::wake_event_loop`.
+    fn wake(&self, screen: &Screen<'static>) {
+        let rc = screen.wake_event_loop();
+        if !self.wake_logged.replace(true) {
+            eink_log!("waking InkView loop after updates: SendEventTo(EVT_CUSTOM) rc={rc:?}");
         }
     }
 
@@ -428,6 +443,7 @@ impl slint::platform::Platform for Backend {
                             // refresh from the current framebuffer.
                             eink_log!("finalize fallback: FullUpdate {}", fmt_rect(&redraw_region));
                             screen.full_update();
+                            self.wake(&screen);
                             dynamic_region_to_redraw = None;
                             accumulated_updates = None;
                             fulfill_dynamic_updates_after = None;
@@ -453,6 +469,7 @@ impl slint::platform::Platform for Backend {
                             redraw_region.width() as u32,
                             redraw_region.height() as u32,
                         );
+                        self.wake(&screen);
                         last_draw_at = Instant::now();
                     }
                 }
@@ -606,6 +623,7 @@ impl slint::platform::Platform for Backend {
                             redraw_region.width() as u32,
                             redraw_region.height() as u32,
                         );
+                        self.wake(&screen);
                         last_draw_at = Instant::now();
                     } else {
                         eink_log!(
@@ -631,6 +649,7 @@ impl slint::platform::Platform for Backend {
                     );
                     accumulated_updates = None;
                     screen.partial_update(origin.x, origin.y, size.width, size.height);
+                    self.wake(&screen);
                     last_draw_at = Instant::now();
                 }
             });
@@ -663,6 +682,7 @@ impl slint::platform::Platform for Backend {
                         self.blit_all(&mut screen);
                         let blit_elapsed = blit_started.elapsed();
                         screen.partial_update(0, 0, self.width as u32, self.height as u32);
+                        self.wake(&screen);
                         drop(screen);
 
                         match kind {
