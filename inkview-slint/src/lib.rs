@@ -14,19 +14,15 @@ use std::{
 
 const SCALE_FACTOR: f32 = 3.0;
 
-/// Damage larger than this is treated as a full UI transition (a card or the
-/// loading screen), not an animation. Such regions must not use DynamicUpdate.
-const LARGE_DAMAGE_AREA: i32 = 20_000;
+/// Damage above this while the panel is busy is treated as a card/text
+/// transition: do not use DynamicUpdate. Button animations and other small
+/// feedback are well below this and stay on the fast dynamic path.
+const LARGE_DAMAGE_AREA: i32 = 100_000;
 
 /// Delay after the immediate show/resume present before verifying it with a
 /// second full present. The immediate update can be discarded while the task
 /// switch is still in flight; the verification does not delay the first frame.
 const SHOW_SETTLE: Duration = Duration::from_millis(300);
-
-/// Delay after an immediate large-transition present (loading screen, card,
-/// screen switch) before verifying it. The touch feedback update can otherwise
-/// discard the immediate frame; the verification is the safety net.
-const TRANSITION_SETTLE: Duration = Duration::from_millis(300);
 
 #[repr(transparent)]
 #[derive(Clone, Copy)]
@@ -314,19 +310,30 @@ impl slint::platform::Platform for Backend {
                         eprintln!("[eink] first full frame rendered");
                     }
 
-                    let damage_area = damage_rect.width() * damage_rect.height();
+                    // Use the actual union of the damage rectangles, not their
+                    // bounding box: an answer change can touch the text area
+                    // and the rating buttons while leaving the menu untouched.
+                    let damage_area: i32 = damage
+                        .iter()
+                        .map(|(_, size)| size.width as i32 * size.height as i32)
+                        .sum();
+                    let full_transition_area =
+                        (self.width as i64 * self.height as i64 * 9 / 10) as i32;
 
-                    if full_present_at.is_none() && damage_area > LARGE_DAMAGE_AREA {
-                        // Show the new screen immediately, then verify it after
-                        // the touch feedback/system update has settled.
+                    if full_present_at.is_none() && damage_area > full_transition_area {
+                        // Only genuine screen replacements use the full-screen
+                        // retained-frame present. Card text, answer reveals and
+                        // button feedback use the normal damage path below.
                         full_present_at = Some(Instant::now());
-                        verify_full_at = Some(Instant::now() + TRANSITION_SETTLE);
+                        // The user is interacting; the show/resume verification
+                        // is no longer needed.
+                        verify_full_at = None;
                         full_present_retries = 0;
                         accumulated_updates = None;
                         dynamic_region_to_redraw = None;
                         fulfill_dynamic_updates_after = None;
                         dynamic_finalize_retries = 0;
-                        eprintln!("[eink] large transition: immediate + verification scheduled");
+                        eprintln!("[eink] full transition: immediate present area={damage_area}");
                     }
 
                     if full_present_at.is_some() {
@@ -366,8 +373,13 @@ impl slint::platform::Platform for Backend {
                         fulfill_dynamic_updates_after =
                             Some(Instant::now() + Duration::from_millis(200));
                     } else {
-                        // Small damage was received while the panel was idle.
-                        // It is safe to present immediately.
+                        if damage_area > LARGE_DAMAGE_AREA {
+                            // Medium/large text or card update while the panel
+                            // reports idle. Wait for the touch feedback update
+                            // so the partial is not discarded.
+                            eprintln!("[eink] medium update area={damage_area}: waiting for panel");
+                            screen.wait_for_update_complete();
+                        }
                         accumulated_updates = None;
                         screen.partial_update(
                             damage.bounding_box_origin().x,
