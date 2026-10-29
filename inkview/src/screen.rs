@@ -57,6 +57,42 @@ impl<'a> Screen<'a> {
         }
     }
 
+    /// Copy a rectangle of 8-bit gray pixels into the framebuffer, one row at a
+    /// time.
+    ///
+    /// `src` holds rows of `src_stride` pixels; the rectangle is read from the
+    /// same `(x, y)` offset in `src` as it is written to in the framebuffer.
+    /// The rectangle is clipped to the screen and to `src`.
+    pub fn copy_gray_rect(
+        &mut self,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+        src: &[u8],
+        src_stride: usize,
+    ) {
+        let x_end = (x + w).min(self.width).min(src_stride);
+        let y_end = (y + h).min(self.height);
+        if x >= x_end {
+            return;
+        }
+        let len = x_end - x;
+
+        for row in y..y_end {
+            let src_start = row * src_stride + x;
+            let Some(src_row) = src.get(src_start..src_start + len) else {
+                return;
+            };
+            // SAFETY: `row < height` and `x + len <= width <= stride`, so the
+            // destination row lies within the task framebuffer.
+            let dst = unsafe {
+                core::slice::from_raw_parts_mut(self.buf.add(self.stride * row + x), len)
+            };
+            dst.copy_from_slice(src_row);
+        }
+    }
+
     pub fn full_update(&mut self) {
         unsafe {
             self.iv.FullUpdate();
