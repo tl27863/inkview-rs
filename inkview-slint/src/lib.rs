@@ -27,9 +27,8 @@ const SHOW_SETTLE: Duration = Duration::from_millis(300);
 
 /// Delay before presenting a large UI transition (loading screen, card, screen
 /// switch). The touch that triggered it can still have a panel update in
-/// flight, and an immediate PartialUpdate may then be discarded. Keep this
-/// shorter than [`SHOW_SETTLE`]: the user is actively interacting.
-const TRANSITION_SETTLE: Duration = Duration::from_millis(200);
+/// flight, and an immediate PartialUpdate may then be discarded.
+const TRANSITION_SETTLE: Duration = Duration::from_millis(300);
 
 #[repr(transparent)]
 #[derive(Clone, Copy)]
