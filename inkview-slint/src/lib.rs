@@ -18,6 +18,13 @@ const SCALE_FACTOR: f32 = 3.0;
 /// loading screen), not an animation. Such regions must not use DynamicUpdate.
 const LARGE_DAMAGE_AREA: i32 = 20_000;
 
+/// How long to let InkView settle after Show/Foreground/Repaint before
+/// presenting the whole retained frame. The panel can still be updating from a
+/// task switch when the first frame is rendered, so an immediate PartialUpdate
+/// is discarded. This is deliberately short; the full present below is retried
+/// while the panel reports that it is busy.
+const SHOW_SETTLE: Duration = Duration::from_millis(300);
+
 #[repr(transparent)]
 #[derive(Clone, Copy)]
 struct GrayScalePixel(u8);
@@ -53,6 +60,23 @@ impl Backend {
             height,
             window: Default::default(),
             buffer: buffer.into(),
+        }
+    }
+
+    /// Copy the retained frame into the task framebuffer.
+    ///
+    /// InkView can blank or replace the task framebuffer while another task is
+    /// in front. Re-blitting the retained frame before a full-screen update
+    /// makes a show/resume independent of whatever currently sits in that
+    /// buffer.
+    fn blit_all(&self, screen: &mut Screen<'static>) {
+        let buffer = self.buffer.borrow();
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let c = buffer[y * self.width + x];
+                let c = GrayScalePixel::from_rgb(c.r, c.g, c.b);
+                screen.draw(x, y, c.0);
+            }
         }
     }
 }
@@ -113,32 +137,49 @@ impl slint::platform::Platform for Backend {
         let mut dynamic_finalize_retries: u32 = 0;
         let mut last_draw_at = Instant::now();
 
+        // A full present is delayed after Show/Foreground/Repaint. InkView can
+        // still be updating the panel from the task switch when the first
+        // frame is rendered; an immediate PartialUpdate is then discarded.
+        // Keeping a pending full present and re-blitting the retained frame
+        // makes the first frame (and resume) independent of that race.
+        let mut full_present_at: Option<Instant> = Some(Instant::now() + SHOW_SETTLE);
+        let mut full_present_retries: u32 = 0;
+        let mut first_full_render_done = false;
+        let mut force_full_render = false;
+
         loop {
             slint::platform::update_timers_and_animations();
 
             if let Some(window) = self.window.borrow().clone() {
+                let now = Instant::now();
+                if full_present_at.is_some_and(|at| now >= at) && !first_full_render_done {
+                    // The first present has no complete frame yet. Force one
+                    // full render so the re-blit below has valid pixels.
+                    force_full_render = true;
+                    window.request_redraw();
+                }
+
                 let delay = if window.has_active_animations() {
                     None
                 } else {
-                    match (
+                    [
                         slint::platform::duration_until_next_timer_update(),
-                        fulfill_dynamic_updates_after.map(|i| i.duration_since(Instant::now())),
-                    ) {
-                        (Some(a), Some(b)) => Some(a.min(b)),
-                        (Some(a), None) => Some(a),
-                        (_, b) => b,
-                    }
+                        fulfill_dynamic_updates_after
+                            .map(|i| i.saturating_duration_since(Instant::now())),
+                        full_present_at.map(|i| i.saturating_duration_since(Instant::now())),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .min()
+                    .or(Some(Duration::from_millis(1000)))
                 };
 
                 let evt = if let Some(delay) = delay {
-                    self.evts
-                        .recv_timeout(delay)
-                        .ok()
-                        .and_then(ink_evt_to_slint)
+                    self.evts.recv_timeout(delay).ok()
                 } else if window.has_active_animations() {
-                    self.evts.try_recv().ok().and_then(ink_evt_to_slint)
+                    self.evts.try_recv().ok()
                 } else {
-                    self.evts.recv().ok().and_then(ink_evt_to_slint)
+                    self.evts.recv().ok()
                 };
 
                 if let Some(redraw_region) = dynamic_region_to_redraw {
@@ -186,12 +227,46 @@ impl slint::platform::Platform for Backend {
                 slint::platform::update_timers_and_animations();
 
                 if let Some(evt) = evt {
-                    window.dispatch_event(evt);
+                    match evt {
+                        Event::Show | Event::Repaint | Event::Foreground { .. } => {
+                            full_present_at = Some(Instant::now() + SHOW_SETTLE);
+                            full_present_retries = 0;
+                            // Drop any pending dynamic presentation; the full
+                            // present below covers the whole frame.
+                            dynamic_region_to_redraw = None;
+                            accumulated_updates = None;
+                            fulfill_dynamic_updates_after = None;
+                            dynamic_finalize_retries = 0;
+                            window.request_redraw();
+                            eprintln!("[eink] show repaint scheduled");
+                        }
+                        Event::Background { .. } | Event::Hide => {
+                            // Do not present into a task that is no longer visible.
+                            full_present_at = None;
+                            full_present_retries = 0;
+                            force_full_render = false;
+                        }
+                        _ => {}
+                    }
+
+                    if let Some(evt) = ink_evt_to_slint(evt) {
+                        window.dispatch_event(evt);
+                    }
                 }
 
                 window.draw_if_needed(|renderer| {
+                    let full = force_full_render;
+                    if full {
+                        renderer.set_repaint_buffer_type(renderer::RepaintBufferType::NewBuffer);
+                    }
                     let mut buffer = self.buffer.borrow_mut();
                     let damage = renderer.render(buffer.as_mut_slice(), self.width);
+                    if full {
+                        renderer.set_repaint_buffer_type(renderer::RepaintBufferType::ReusedBuffer);
+                        force_full_render = false;
+                        first_full_render_done = true;
+                        eprintln!("[eink] forced full frame rendered");
+                    }
                     let mut screen = self.screen.borrow_mut();
 
                     for dy in 0..damage.bounding_box_size().height {
@@ -210,7 +285,18 @@ impl slint::platform::Platform for Backend {
 
                     let damage_rect = rect_from_phys(damage.clone());
 
-                    if screen.is_updating() {
+                    if !first_full_render_done
+                        && damage_rect.width() >= self.width as i32
+                        && damage_rect.height() >= self.height as i32
+                    {
+                        first_full_render_done = true;
+                        eprintln!("[eink] first full frame rendered");
+                    }
+
+                    if full_present_at.is_some() {
+                        // The pending full present re-blits and presents the
+                        // whole retained frame; skip competing updates here.
+                    } else if screen.is_updating() {
                         if let Some(r) = accumulated_updates.as_mut() {
                             *r = r.union(&damage_rect);
                         } else {
@@ -244,6 +330,14 @@ impl slint::platform::Platform for Backend {
                         fulfill_dynamic_updates_after =
                             Some(Instant::now() + Duration::from_millis(200));
                     } else {
+                        let damage_area = damage_rect.width() * damage_rect.height();
+                        if damage_area > LARGE_DAMAGE_AREA {
+                            // A large transition can follow a previous update
+                            // faster than IsUpdateInProcess() reports it. Wait
+                            // so the loading-to-card update is not discarded.
+                            screen.wait_for_update_complete();
+                        }
+
                         accumulated_updates = None;
                         screen.partial_update(
                             damage.bounding_box_origin().x,
@@ -254,6 +348,41 @@ impl slint::platform::Platform for Backend {
                         last_draw_at = Instant::now();
                     }
                 });
+
+                if let Some(at) = full_present_at {
+                    if Instant::now() >= at {
+                        let mut screen = self.screen.borrow_mut();
+
+                        if screen.is_updating() {
+                            full_present_retries += 1;
+                            if full_present_retries > 100 {
+                                // The panel appears stuck; present the retained
+                                // frame with a flashing full refresh.
+                                self.blit_all(&mut *screen);
+                                screen.full_update();
+                                eprintln!("[eink] full repaint fallback: FullUpdate");
+                                full_present_at = None;
+                                full_present_retries = 0;
+                                dynamic_region_to_redraw = None;
+                                accumulated_updates = None;
+                                fulfill_dynamic_updates_after = None;
+                                last_draw_at = Instant::now();
+                            } else {
+                                full_present_at = Some(Instant::now() + Duration::from_millis(20));
+                            }
+                        } else {
+                            self.blit_all(&mut *screen);
+                            screen.partial_update(0, 0, self.width as u32, self.height as u32);
+                            eprintln!("[eink] full repaint: reblit + partial");
+                            full_present_at = None;
+                            full_present_retries = 0;
+                            dynamic_region_to_redraw = None;
+                            accumulated_updates = None;
+                            fulfill_dynamic_updates_after = None;
+                            last_draw_at = Instant::now();
+                        }
+                    }
+                }
             }
         }
     }

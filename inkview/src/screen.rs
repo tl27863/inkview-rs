@@ -114,6 +114,16 @@ impl<'a> Screen<'a> {
         unsafe { self.iv.IsUpdateInProcess() != 0 }
     }
 
+    /// Block until the current panel update has finished.
+    ///
+    /// Only use this for infrequent transitions (show/resume or a large
+    /// loading/card change); it can block for the duration of an e-ink update.
+    pub fn wait_for_update_complete(&self) {
+        unsafe {
+            self.iv.WaitForUpdateComplete();
+        }
+    }
+
     /// Width of the physical screen (independent of the orientation)
     pub fn width(&self) -> usize {
         self.width
