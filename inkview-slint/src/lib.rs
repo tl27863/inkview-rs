@@ -310,6 +310,11 @@ impl Backend {
     }
 }
 
+/// Compact `WxH+X+Y` form for logs.
+fn fmt_rect(r: &euclid::Rect<i32, euclid::UnknownUnit>) -> String {
+    format!("{}x{}+{}+{}", r.width(), r.height(), r.origin.x, r.origin.y)
+}
+
 fn rect_from_phys(r: &PhysicalRegion) -> euclid::Rect<i32, euclid::UnknownUnit> {
     euclid::Rect::new(
         euclid::Point2D::new(r.bounding_box_origin().x, r.bounding_box_origin().y),
@@ -421,7 +426,7 @@ impl slint::platform::Platform for Backend {
                         if dynamic_finalize_retries > 100 {
                             // The panel appears stuck; recover with a full
                             // refresh from the current framebuffer.
-                            eink_log!("finalize fallback: FullUpdate region={redraw_region:?}");
+                            eink_log!("finalize fallback: FullUpdate {}", fmt_rect(&redraw_region));
                             screen.full_update();
                             dynamic_region_to_redraw = None;
                             accumulated_updates = None;
@@ -433,6 +438,10 @@ impl slint::platform::Platform for Backend {
                                 Some(Instant::now() + Duration::from_millis(20));
                         }
                     } else {
+                        eink_log!(
+                            "update finalize {} retries={dynamic_finalize_retries}",
+                            fmt_rect(&redraw_region)
+                        );
                         dynamic_region_to_redraw = None;
                         accumulated_updates = None;
                         fulfill_dynamic_updates_after = None;
@@ -449,12 +458,18 @@ impl slint::platform::Platform for Backend {
                 }
             }
 
-            slint::platform::update_timers_and_animations();
-
             let mut new_present = false;
             for evt in events.drain(..) {
                 if self.trace_events {
                     eink_log!("evt: {evt:?}");
+                }
+                match evt {
+                    // Taps and keys only, so stalls can be matched to input;
+                    // PointerMove is too frequent to log.
+                    Event::PointerDown { x, y } => eink_log!("pointer down {x},{y}"),
+                    Event::PointerUp { x, y } => eink_log!("pointer up {x},{y}"),
+                    Event::KeyDown { key } => eink_log!("key down {key:?}"),
+                    _ => {}
                 }
                 match evt {
                     Event::Show | Event::Repaint | Event::Foreground { .. } => {
@@ -479,6 +494,11 @@ impl slint::platform::Platform for Backend {
                     window.dispatch_event(evt);
                 }
             }
+
+            // After dispatch, so change handlers queued by input (Slint runs
+            // `changed` callbacks here) take effect in this iteration's render
+            // instead of after the next wakeup.
+            slint::platform::update_timers_and_animations();
 
             if FULL_PRESENT_REQUESTED.swap(false, Ordering::AcqRel) && presenter.visible {
                 // Consume after timers/event dispatch but before rendering,
@@ -539,6 +559,7 @@ impl slint::platform::Platform for Backend {
                 if presenter.is_pending() {
                     // The pending full present re-blits and presents the whole
                     // retained frame; damage only updates the retained buffer.
+                    eink_log!("damage {} held for pending present", fmt_rect(&damage_rect));
                     return;
                 }
 
@@ -574,6 +595,11 @@ impl slint::platform::Platform for Backend {
                         && last_draw_at.elapsed() > Duration::from_millis(20)
                     {
                         let redraw_region = accumulated_updates.take().unwrap();
+                        eink_log!(
+                            "update dynamic {} render={}ms (panel busy)",
+                            fmt_rect(&redraw_region),
+                            render_elapsed.as_millis()
+                        );
                         screen.dynamic_update(
                             redraw_region.origin.x,
                             redraw_region.origin.y,
@@ -581,6 +607,12 @@ impl slint::platform::Platform for Backend {
                             redraw_region.height() as u32,
                         );
                         last_draw_at = Instant::now();
+                    } else {
+                        eink_log!(
+                            "damage {} render={}ms deferred to finalize (panel busy)",
+                            fmt_rect(&damage_rect),
+                            render_elapsed.as_millis()
+                        );
                     }
 
                     if let Some(r) = dynamic_region_to_redraw.as_mut() {
@@ -592,6 +624,11 @@ impl slint::platform::Platform for Backend {
                     fulfill_dynamic_updates_after =
                         Some(Instant::now() + Duration::from_millis(200));
                 } else {
+                    eink_log!(
+                        "update partial {} render={}ms",
+                        fmt_rect(&damage_rect),
+                        render_elapsed.as_millis()
+                    );
                     accumulated_updates = None;
                     screen.partial_update(origin.x, origin.y, size.width, size.height);
                     last_draw_at = Instant::now();
