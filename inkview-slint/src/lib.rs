@@ -350,7 +350,7 @@ impl slint::platform::Platform for Backend {
                 });
 
                 if let Some(at) = full_present_at {
-                    if Instant::now() >= at {
+                    if Instant::now() >= at && !force_full_render {
                         let mut screen = self.screen.borrow_mut();
 
                         if screen.is_updating() {
