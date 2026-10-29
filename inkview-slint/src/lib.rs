@@ -355,6 +355,9 @@ impl slint::platform::Platform for Backend {
 
                         if screen.is_updating() {
                             full_present_retries += 1;
+                            if full_present_retries == 1 {
+                                eprintln!("[eink] full repaint waiting for panel");
+                            }
                             if full_present_retries > 100 {
                                 // The panel appears stuck; present the retained
                                 // frame with a flashing full refresh.
