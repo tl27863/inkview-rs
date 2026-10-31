@@ -8,12 +8,12 @@ edition = "2024"
 [dependencies]
 euclid = "0.22.14"
 rgb = "0.8.53"
-slint = { version = "1.17.1", default-features = false, features = ["compat-1-2", "std", "software-renderer-systemfonts", "renderer-software"] }
+slint = { version = "1.18.1", default-features = false, features = ["compat-1-2", "std", "software-renderer-systemfonts", "renderer-software"] }
 inkview = { path = "../../inkview", version = "0.3.0", default-features = false}
 inkview-slint = { path = "../../inkview-slint", version = "0.3.0", default-features = false}
 
 [build-dependencies]
-slint-build = { version = "1.17.1" }
+slint-build = { version = "1.18.1" }
 
 [features]
 default = ["sdk-6-11"]
