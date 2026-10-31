@@ -16,7 +16,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Used when the screen reports no usable DPI/scale (see `scale_from_screen`).
+/// Used when the screen reports no usable DPI (see `scale_from_dpi`).
 /// The pbanki UI was laid out for 3.0 on a 300 dpi panel.
 const DEFAULT_SCALE_FACTOR: f32 = 3.0;
 
@@ -121,10 +121,14 @@ impl EventLoopProxy for Proxy {
     }
 }
 
-/// `dpi / 100 × scale` from InkView, or `DEFAULT_SCALE_FACTOR` if that is out
-/// of the plausible range (some firmware reports 0).
-fn scale_from_screen<P>(screen: &Screen<P>) -> f32 {
-    let scale = screen.dpi() as f32 / 100.0 * screen.scale();
+/// `dpi / 100`, so a logical pixel has the same physical size on every panel,
+/// or `DEFAULT_SCALE_FACTOR` if that is out of the plausible range (some
+/// firmware reports 0).
+///
+/// InkView's screen scale factor is not applied: it carries the firmware's UI
+/// zoom (1.16 on a PB710 at 300 dpi), which would enlarge the whole layout.
+fn scale_from_dpi(dpi: u32) -> f32 {
+    let scale = dpi as f32 / 100.0;
     if (1.5..=6.0).contains(&scale) {
         scale
     } else {
@@ -323,7 +327,7 @@ impl<P: PixelFormat + Default> Backend<P> {
     ) -> Self {
         let width = screen.width();
         let height = screen.height();
-        let scale_factor = scale_from_screen(&screen);
+        let scale_factor = scale_from_dpi(screen.dpi());
 
         EPOCH.get_or_init(Instant::now);
         let trace_events = std::env::var_os("INKVIEW_SLINT_TRACE_EVENTS").is_some();
@@ -896,6 +900,14 @@ mod tests {
         let mut px = Pixel(RGB24(255, 255, 255));
         px.blend(color(0, 0, 128, 128));
         assert_eq!(px.0, RGB24(127, 127, 255));
+    }
+
+    #[test]
+    fn scale_follows_dpi_with_fallback() {
+        assert_eq!(scale_from_dpi(300), 3.0);
+        assert_eq!(scale_from_dpi(212), 2.12);
+        assert_eq!(scale_from_dpi(0), DEFAULT_SCALE_FACTOR);
+        assert_eq!(scale_from_dpi(1000), DEFAULT_SCALE_FACTOR);
     }
 
     #[test]
