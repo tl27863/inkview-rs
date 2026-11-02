@@ -21,7 +21,7 @@ use std::{
     cell::RefCell,
     rc::Rc,
     sync::mpsc::{Receiver, Sender},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 /// Render target in the task framebuffer's own pixel format (`BB8` on
@@ -204,22 +204,10 @@ impl<S: EinkScreen> slint::platform::Platform for Backend<S> {
 
             eink.sample_panel();
 
-            let delay = if full_present_requested() {
-                // A timer may have requested a transition earlier in this
-                // iteration. Do not block before consuming that request.
-                Some(Duration::ZERO)
-            } else if window.has_active_animations() {
-                None
-            } else {
-                [
-                    slint::platform::duration_until_next_timer_update(),
-                    eink.deadline(),
-                ]
-                .into_iter()
-                .flatten()
-                .min()
-                .or(Some(Duration::from_millis(1000)))
-            };
+            let delay = eink.wait_delay(
+                slint::platform::duration_until_next_timer_update(),
+                window.has_active_animations(),
+            );
 
             // Block for the first event, then drain everything already queued
             // so back-to-back Show/Foreground produce a single present.

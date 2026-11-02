@@ -58,6 +58,10 @@ use damage::DamagePath;
 use present::{PresentReason, Presenter, take_full_present_request};
 use surface::{Surface, fmt_rect};
 
+/// Wait for events when neither the UI nor the presenter has a deadline.
+/// Not a cap: a later UI timer is waited for in full.
+pub const IDLE_WAIT: Duration = Duration::from_secs(1);
+
 /// Used when the screen reports no usable DPI (see `scale_from_dpi`).
 /// The pbanki UI was laid out for 3.0 on a 300 dpi panel.
 pub const DEFAULT_SCALE_FACTOR: f32 = 3.0;
@@ -104,8 +108,10 @@ pub struct Lifecycle {
 ///
 /// 1. The backend's own timers and animations.
 /// 2. [`sample_panel`](Self::sample_panel).
-/// 3. Wait for events: no wait if [`full_present_requested`]
-///    is set, else at most the backend's timers and [`deadline`](Self::deadline) (max 1 s).
+/// 3. Wait for events for [`wait_delay`](Self::wait_delay) (no wait if the
+///    application requested a present, else until the backend's next timer
+///    or [`deadline`](Self::deadline), 1 s if neither is set), through
+///    [`wait_events`].
 /// 4. Drain the queue, so Show and Foreground become one present.
 /// 5. [`before_dispatch`](Self::before_dispatch) (the finalizer).
 /// 6. For each InkView event: [`on_event`](Self::on_event), then the input
@@ -209,6 +215,29 @@ impl<S: EinkScreen> EinkPresenter<S> {
         .into_iter()
         .flatten()
         .min()
+    }
+
+    /// Step 3: how long the backend waits for events. `ui_deadline` is the
+    /// UI's next timer, `animating` whether the UI animates.
+    ///
+    /// `Some(ZERO)` if the application requested a present, so a request
+    /// from a timer earlier in this iteration is not left waiting. `None` (do
+    /// not block) while the UI animates. Else the earliest of `ui_deadline`
+    /// and [`deadline`](Self::deadline), or [`IDLE_WAIT`] if neither is set.
+    pub fn wait_delay(&self, ui_deadline: Option<Duration>, animating: bool) -> Option<Duration> {
+        if full_present_requested() {
+            Some(Duration::ZERO)
+        } else if animating {
+            None
+        } else {
+            Some(
+                [ui_deadline, self.deadline()]
+                    .into_iter()
+                    .flatten()
+                    .min()
+                    .unwrap_or(IDLE_WAIT),
+            )
+        }
     }
 
     /// Step 5: the finalizer of the damage path.
@@ -410,6 +439,18 @@ mod tests {
         eink.after_render();
     }
 
+    /// Presents and verifies the launch frame, then waits until the panel
+    /// is idle: nothing pending, no deadline.
+    fn settle(clock: &Clock, screen: &MockScreen, eink: &mut EinkPresenter<MockScreen>) {
+        iterate(eink, &[], Some(whole_content()));
+        clock.advance(MS(400));
+        iterate(eink, &[], None);
+        clock.advance(MS(500));
+        iterate(eink, &[], None);
+        assert_eq!(screen.take_calls(), [present(), present()].concat());
+        assert_eq!(eink.deadline(), None);
+    }
+
     #[test]
     fn launch_present_verify_then_content_updates() {
         let _latch = LATCH.lock().unwrap_or_else(|e| e.into_inner());
@@ -589,6 +630,34 @@ mod tests {
         assert!(eink.full_render_needed());
         eink.submit_frame(rect(0, 0, W as i32, (H - 30) as i32), MS(10), true);
         assert!(!eink.full_render_needed());
+    }
+
+    #[test]
+    fn wait_delay_follows_the_request_animations_and_deadlines() {
+        let _latch = LATCH.lock().unwrap_or_else(|e| e.into_inner());
+        let (clock, screen, mut eink) = setup();
+        settle(&clock, &screen, &mut eink);
+
+        // Nothing due: 1 s, but a later UI timer is not cut short.
+        assert_eq!(eink.wait_delay(None, false), Some(IDLE_WAIT));
+        assert_eq!(eink.wait_delay(Some(MS(5000)), false), Some(MS(5000)));
+        assert_eq!(eink.wait_delay(Some(MS(30)), false), Some(MS(30)));
+        // Animations: do not block.
+        assert_eq!(eink.wait_delay(Some(MS(30)), true), None);
+
+        // Busy panel: the 50 ms panel sampling is the earliest deadline.
+        clock.advance(MS(30));
+        screen.set_busy(true);
+        iterate(&mut eink, &[], Some(rect(0, 0, 10, 10)));
+        assert_eq!(
+            eink.wait_delay(Some(MS(5000)), false),
+            Some(crate::present::PANEL_POLL)
+        );
+
+        // An application request wins over everything.
+        request_full_present();
+        assert_eq!(eink.wait_delay(Some(MS(30)), true), Some(Duration::ZERO));
+        crate::present::take_full_present_request();
     }
 
     #[test]
