@@ -32,7 +32,7 @@ const PANEL_POLL_SLOW: Duration = Duration::from_millis(500);
 
 static FULL_PRESENT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-/// Requests a non-flashing, full-frame `PartialUpdate` after the current Slint
+/// Requests a non-flashing, full-frame `PartialUpdate` after the UI's current
 /// damage has been rendered. This does not invoke InkView's flashing
 /// `FullUpdate` and is intended only for genuine screen transitions.
 ///

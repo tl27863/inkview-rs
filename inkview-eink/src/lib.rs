@@ -82,12 +82,19 @@ pub fn scale_from_dpi(dpi: u32) -> f32 {
 }
 
 /// Presenter settings beyond the screen itself.
+///
+/// The environment is read in two places. [`EinkPresenter::new`] applies
+/// [`UPDATES_ENV`] on top of `policy` itself. The caller reads
+/// `INKVIEW_SLINT_TRACE_EVENTS` and sets `trace_events`, because
+/// `inkview-slint` also logs it in its startup line. A new backend must read
+/// it too. Both names keep the `INKVIEW_SLINT_` prefix, so device test
+/// commands do not change.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct EinkOptions {
     /// Update mode per class of screen change. `INKVIEW_SLINT_UPDATES`
     /// overrides individual classes on top of this.
     pub policy: UpdatePolicy,
-    /// Log every InkView event (`INKVIEW_SLINT_TRACE_EVENTS`).
+    /// Log every InkView event. The caller reads `INKVIEW_SLINT_TRACE_EVENTS`.
     pub trace_events: bool,
 }
 
@@ -124,6 +131,10 @@ pub struct Lifecycle {
 ///    (in full if [`full_render_needed`](Self::full_render_needed)), then
 ///    [`submit_frame`](Self::submit_frame).
 /// 10. [`after_render`](Self::after_render) (issues a due full present).
+///
+/// The types do not enforce this order; each backend follows it. Once a
+/// second backend exists, a shared loop driver over a backend trait can
+/// replace this list (see pbAnki's `notes/eink-presenter-refactor.md`).
 pub struct EinkPresenter<S: EinkScreen> {
     clock: Clock,
     surface: Surface<S>,
@@ -140,7 +151,7 @@ pub struct EinkPresenter<S: EinkScreen> {
 impl<S: EinkScreen> EinkPresenter<S> {
     /// Logs the update policy (with `INKVIEW_SLINT_UPDATES` applied), the
     /// waveform times and the panel. Call [`start`](Self::start) when the
-    /// event loop starts.
+    /// event loop starts: until then no present is pending.
     pub fn new(screen: S, options: EinkOptions) -> Self {
         Self::with_clock(screen, options, Clock::default())
     }
@@ -174,6 +185,12 @@ impl<S: EinkScreen> EinkPresenter<S> {
     }
 
     /// Requests the launch present. Call once, when the event loop starts.
+    ///
+    /// This is separate from `new` because the backend is built before the
+    /// loop runs: the `request reason=Launch` line and the `after=` time of
+    /// the launch present count from the loop start, as before the refactor.
+    /// Without `start`, nothing presents the first frame and the screen stays
+    /// as it was. A second call starts over, like a new loop.
     pub fn start(&mut self) {
         self.presenter = Presenter::new(self.clock.clone());
         self.damage = DamagePath::new(self.clock.clone());
