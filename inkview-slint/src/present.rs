@@ -43,7 +43,7 @@ pub fn request_full_present() {
 }
 
 /// Whether the application requested a full present that is not consumed yet.
-pub(crate) fn full_present_requested() -> bool {
+pub fn full_present_requested() -> bool {
     FULL_PRESENT_REQUESTED.load(Ordering::Acquire)
 }
 
@@ -118,6 +118,17 @@ impl Presenter {
                 waiting_since: None,
                 next_attempt: now,
             },
+            visible: true,
+            have_frame: false,
+            panel_busy_since: None,
+        }
+    }
+
+    /// No present yet; `new` starts the launch present.
+    pub fn idle(clock: Clock) -> Self {
+        Self {
+            clock,
+            state: PresentState::Idle,
             visible: true,
             have_frame: false,
             panel_busy_since: None,
@@ -301,7 +312,7 @@ impl Presenter {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::mock_screen::{Call, MockScreen};
     use inkview::screen::UpdateKind;
@@ -391,7 +402,7 @@ mod tests {
 
     #[test]
     fn hide_drops_the_present_and_the_latch() {
-        let _latch = LATCH.lock().unwrap();
+        let _latch = LATCH.lock().unwrap_or_else(|e| e.into_inner());
         let mut presenter = Presenter::new(Clock::manual());
         request_full_present();
         presenter.hide();

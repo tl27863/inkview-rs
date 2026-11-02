@@ -16,6 +16,7 @@ macro_rules! eink_log {
 
 mod clock;
 mod damage;
+mod eink;
 mod eink_screen;
 #[cfg(test)]
 mod mock_screen;
@@ -23,16 +24,15 @@ mod policy;
 mod present;
 mod surface;
 
+pub use eink::{EinkOptions, EinkPresenter, Lifecycle, PointerKind, content_pointer};
 pub use eink_screen::EinkScreen;
 pub use policy::{UPDATES_ENV, UpdateMode, UpdatePolicy};
-pub use present::request_full_present;
+pub use present::{full_present_requested, request_full_present};
+pub use surface::Rect;
 
-use clock::Clock;
-use damage::DamagePath;
 use inkview::Event as InkEvent;
 use inkview::event::Key;
 use inkview::screen::PixelFormat;
-use present::{PresentReason, Presenter, full_present_requested, take_full_present_request};
 use slint::platform::{
     EventLoopProxy, WindowEvent,
     software_renderer::{self as renderer, PhysicalRegion, PremultipliedRgbaColor, TargetPixel},
@@ -43,7 +43,6 @@ use std::{
     sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError},
     time::Duration,
 };
-use surface::{Rect, Surface, fmt_rect};
 
 /// Used when the screen reports no usable DPI (see `scale_from_dpi`).
 /// The pbanki UI was laid out for 3.0 on a 300 dpi panel.
@@ -127,13 +126,11 @@ pub struct BackendOptions {
 }
 
 pub struct Backend<S: EinkScreen + 'static> {
-    surface: RefCell<Surface<S>>,
+    eink: RefCell<EinkPresenter<S>>,
     sender: Sender<Event>,
     receiver: Receiver<Event>,
     scale_factor: f32,
-    policy: UpdatePolicy,
     window: RefCell<Option<Rc<renderer::MinimalSoftwareWindow>>>,
-    trace_events: bool,
 }
 
 impl<S: EinkScreen> Backend<S> {
@@ -165,52 +162,30 @@ impl<S: EinkScreen> Backend<S> {
             if trace_events { ", tracing events" } else { "" }
         );
 
-        let mut policy = options.policy;
-        if let Ok(spec) = std::env::var(UPDATES_ENV) {
-            for ignored in policy.apply_overrides(&spec) {
-                eink_log!("{UPDATES_ENV}: ignored {ignored}");
-            }
-        }
-        eink_log!("update policy: {policy}");
-        match screen.waveform_times() {
-            Some(times) => eink_log!("waveform times (ms, by waveform id): {times:?}"),
-            None => eink_log!("waveform times unavailable"),
-        }
-        if let Some(info) = screen.panel_info() {
-            eink_log!("{info}");
-        }
-
+        let eink = EinkPresenter::new(
+            screen,
+            EinkOptions {
+                policy: options.policy,
+                trace_events,
+            },
+        );
         Self {
-            surface: Surface::new(screen).into(),
+            eink: eink.into(),
             sender,
             receiver,
             scale_factor,
-            policy,
             window: Default::default(),
-            trace_events,
         }
     }
 
     /// Sizes the Slint window to the content area.
-    fn resize_window(&self) {
+    fn resize_window(&self, (width, height): (usize, usize)) {
         if let Some(window) = self.window.borrow().as_ref() {
-            let surface = self.surface.borrow();
             slint::Window::set_size(
                 window.as_ref(),
-                slint::PhysicalSize::new(surface.width as u32, surface.content_height() as u32)
-                    .to_logical(self.scale_factor),
+                slint::PhysicalSize::new(width as u32, height as u32).to_logical(self.scale_factor),
             );
         }
-    }
-
-    /// Re-reads the panel height. If it changed, resizes the retained buffer
-    /// and the window; returns true so the caller forces a full render.
-    fn refresh_panel_height(&self) -> bool {
-        if !self.surface.borrow_mut().refresh_panel_height() {
-            return false;
-        }
-        self.resize_window();
-        true
     }
 
     /// Access the event sender; clone it to send in InkView events.
@@ -245,9 +220,11 @@ impl<S: EinkScreen> slint::platform::Platform for Backend<S> {
         }))
     }
 
+    /// One iteration follows the order documented on [`EinkPresenter`].
     fn run_event_loop(&self) -> Result<(), slint::PlatformError> {
         let scale_factor = self.scale_factor;
-        self.resize_window();
+        let mut eink = self.eink.borrow_mut();
+        self.resize_window(eink.content_size());
 
         self.window
             .borrow()
@@ -255,12 +232,7 @@ impl<S: EinkScreen> slint::platform::Platform for Backend<S> {
             .unwrap()
             .dispatch_event(WindowEvent::ScaleFactorChanged { scale_factor });
 
-        let clock = Clock::default();
-        // Normal damage path: dynamic updates while the panel is busy, then a
-        // final partial update of the accumulated region once it settles.
-        let mut damage_path = DamagePath::new(clock.clone());
-        let mut presenter = Presenter::new(clock.clone());
-        let mut force_full_render = false;
+        eink.start();
         let mut events: Vec<Event> = Vec::new();
 
         loop {
@@ -270,7 +242,7 @@ impl<S: EinkScreen> slint::platform::Platform for Backend<S> {
                 continue;
             };
 
-            presenter.sample_panel(&mut self.surface.borrow_mut().screen);
+            eink.sample_panel();
 
             let delay = if full_present_requested() {
                 // A timer may have requested a transition earlier in this
@@ -279,14 +251,9 @@ impl<S: EinkScreen> slint::platform::Platform for Backend<S> {
             } else if window.has_active_animations() {
                 None
             } else {
-                let now = clock.now();
                 [
                     slint::platform::duration_until_next_timer_update(),
-                    damage_path.deadline(now),
-                    presenter
-                        .next_deadline()
-                        .map(|i| i.saturating_duration_since(now)),
-                    presenter.panel_poll_interval(),
+                    eink.deadline(),
                 ]
                 .into_iter()
                 .flatten()
@@ -316,9 +283,8 @@ impl<S: EinkScreen> slint::platform::Platform for Backend<S> {
                 }
             }
 
-            damage_path.finalize(&mut self.surface.borrow_mut(), &self.policy);
+            eink.before_dispatch();
 
-            let mut new_present = false;
             for evt in events.drain(..) {
                 // Callbacks run in queue order with InkView events, before
                 // timers and the full-present latch below, so a callback that
@@ -331,41 +297,15 @@ impl<S: EinkScreen> slint::platform::Platform for Backend<S> {
                     }
                     Event::Quit => return Ok(()),
                 };
-                if self.trace_events {
-                    eink_log!("evt: {evt:?}");
+                let lifecycle = eink.on_event(&evt);
+                if lifecycle.resized {
+                    self.resize_window(eink.content_size());
                 }
-                match evt {
-                    // Taps and keys only, so stalls can be matched to input;
-                    // PointerMove is too frequent to log.
-                    InkEvent::PointerDown { x, y } => eink_log!("pointer down {x},{y}"),
-                    InkEvent::PointerUp { x, y } => eink_log!("pointer up {x},{y}"),
-                    InkEvent::KeyDown { key } => eink_log!("key down {key:?}"),
-                    _ => {}
-                }
-                match evt {
-                    InkEvent::Show | InkEvent::Repaint | InkEvent::Foreground { .. } => {
-                        presenter.visible = true;
-                        if self.refresh_panel_height() {
-                            force_full_render = true;
-                        }
-                        let reason = match evt {
-                            InkEvent::Show => PresentReason::Show,
-                            InkEvent::Repaint => PresentReason::Repaint,
-                            _ => PresentReason::Foreground,
-                        };
-                        new_present |= presenter.request(reason);
-                        window.request_redraw();
-                    }
-                    InkEvent::Background { .. } | InkEvent::Hide => {
-                        // Do not present into a task that is no longer visible.
-                        presenter.hide();
-                        force_full_render = false;
-                    }
-                    _ => {}
+                if lifecycle.redraw {
+                    window.request_redraw();
                 }
 
-                let top = self.surface.borrow().top as i32;
-                if let Some(evt) = ink_evt_to_slint(scale_factor, top, evt) {
+                if let Some(evt) = ink_evt_to_slint(scale_factor, eink.top() as i32, evt) {
                     window.dispatch_event(evt);
                 }
             }
@@ -375,83 +315,26 @@ impl<S: EinkScreen> slint::platform::Platform for Backend<S> {
             // instead of after the next wakeup.
             slint::platform::update_timers_and_animations();
 
-            if take_full_present_request() && presenter.visible {
-                // Consume after timers/event dispatch but before rendering,
-                // so the full present contains the screen that requested it
-                // and the normal damage path does not race it.
-                new_present |= presenter.request(PresentReason::App);
-                window.request_redraw();
-            }
-
-            presenter.poll_verification(clock.now());
-
-            if new_present {
-                // The full present below covers the whole frame; drop any
-                // pending dynamic presentation.
-                damage_path.drop_waiting();
-            }
-
-            if presenter.is_pending() && !presenter.have_frame {
-                // No complete frame yet. Force one full render so the re-blit
-                // below has valid pixels.
-                force_full_render = true;
+            if eink.after_dispatch() {
                 window.request_redraw();
             }
 
             window.draw_if_needed(|renderer| {
-                let full = force_full_render;
+                let full = eink.full_render_needed();
                 if full {
                     renderer.set_repaint_buffer_type(renderer::RepaintBufferType::NewBuffer);
                 }
-                let mut surface = self.surface.borrow_mut();
-                let width = surface.width;
+                let width = eink.width();
                 let render_started = Instant::now();
-                let damage = renderer.render(target_pixels(&mut surface.frame), width);
+                let damage = renderer.render(target_pixels(eink.frame_mut()), width);
                 if full {
                     renderer.set_repaint_buffer_type(renderer::RepaintBufferType::ReusedBuffer);
-                    force_full_render = false;
                 }
                 let render_elapsed = render_started.elapsed();
-
-                let damage_rect = rect_from_phys(&damage);
-                let full_damage = damage_rect.width() >= width as i32
-                    && damage_rect.height() >= surface.content_height() as i32;
-                if !presenter.have_frame && (full || full_damage) {
-                    presenter.have_frame = true;
-                    eink_log!(
-                        "first full frame rendered in {}ms",
-                        render_elapsed.as_millis()
-                    );
-                } else if render_elapsed > Duration::from_millis(500) {
-                    eink_log!(
-                        "slow render: {}ms damage={damage_rect:?}",
-                        render_elapsed.as_millis()
-                    );
-                }
-
-                if presenter.is_pending() {
-                    // The pending full present re-blits and presents the whole
-                    // retained frame; damage only updates the retained buffer.
-                    eink_log!("damage {} held for pending present", fmt_rect(&damage_rect));
-                    return;
-                }
-
-                if damage_rect.is_empty() {
-                    // Nothing changed on screen (e.g. a tap on a control
-                    // without pressed styles); issue no zero-area update.
-                    return;
-                }
-
-                damage_path.submit(&mut surface, &self.policy, damage_rect, render_elapsed);
+                eink.submit_frame(rect_from_phys(&damage), render_elapsed, full);
             });
 
-            if presenter.issue_due(
-                &mut self.surface.borrow_mut(),
-                &self.policy,
-                force_full_render,
-            ) {
-                damage_path.presented();
-            }
+            eink.after_render();
         }
     }
 }
@@ -480,19 +363,20 @@ fn ink_key_to_slint(key: Key) -> Option<slint::platform::Key> {
 /// (the system panel's rows); presses on the panel itself are not forwarded,
 /// since the firmware handles them.
 fn ink_evt_to_slint(scale_factor: f32, top: i32, evt: InkEvent) -> Option<WindowEvent> {
-    let position =
-        |x: i32, y: i32| slint::PhysicalPosition { x, y: y - top }.to_logical(scale_factor);
+    let position = |kind, x, y| {
+        let (x, y) = content_pointer(top, kind, x, y)?;
+        Some(slint::PhysicalPosition { x, y }.to_logical(scale_factor))
+    };
     let evt = match evt {
-        InkEvent::PointerDown { y, .. } if y < top => return None,
         InkEvent::PointerDown { x, y } => WindowEvent::PointerPressed {
-            position: position(x, y),
+            position: position(PointerKind::Down, x, y)?,
             button: slint::platform::PointerEventButton::Left,
         },
         InkEvent::PointerMove { x, y } => WindowEvent::PointerMoved {
-            position: position(x, y.max(top)),
+            position: position(PointerKind::Move, x, y)?,
         },
         InkEvent::PointerUp { x, y } => WindowEvent::PointerReleased {
-            position: position(x, y.max(top)),
+            position: position(PointerKind::Up, x, y)?,
             button: slint::platform::PointerEventButton::Left,
         },
         InkEvent::Foreground { .. } => WindowEvent::WindowActiveChanged(true),

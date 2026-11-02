@@ -4,7 +4,7 @@
 use crate::eink_screen::EinkScreen;
 use crate::policy::UpdateMode;
 
-pub(crate) type Rect = euclid::Rect<i32, euclid::UnknownUnit>;
+pub type Rect = euclid::Rect<i32, euclid::UnknownUnit>;
 
 /// Compact `WxH+X+Y` form for logs.
 pub(crate) fn fmt_rect(r: &Rect) -> String {
