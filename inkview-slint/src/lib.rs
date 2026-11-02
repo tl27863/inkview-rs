@@ -1,4 +1,6 @@
 mod eink_screen;
+#[cfg(test)]
+mod mock_screen;
 mod policy;
 
 pub use eink_screen::EinkScreen;
@@ -969,7 +971,8 @@ fn ink_evt_to_slint(scale_factor: f32, top: i32, evt: InkEvent) -> Option<Window
 #[cfg(test)]
 mod tests {
     use super::*;
-    use inkview::screen::{BB8, RGB24};
+    use crate::mock_screen::{Call, MockScreen};
+    use inkview::screen::{BB8, RGB24, UpdateKind};
 
     fn color(red: u8, green: u8, blue: u8, alpha: u8) -> PremultipliedRgbaColor {
         PremultipliedRgbaColor {
@@ -1033,5 +1036,185 @@ mod tests {
     fn pixel_buffer_casts_to_formats() {
         let buffer = [Pixel(RGB24(1, 2, 3)), Pixel(RGB24(4, 5, 6))];
         assert_eq!(pixels(&buffer), &[RGB24(1, 2, 3), RGB24(4, 5, 6)]);
+    }
+
+    /// Serializes tests that use the process-wide full-present latch.
+    static LATCH: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn pending(presenter: &Presenter) -> Option<(PresentKind, PresentReason)> {
+        match presenter.state {
+            PresentState::Pending { kind, reason, .. } => Some((kind, reason)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn presenter_starts_with_a_launch_present() {
+        let presenter = Presenter::new();
+        assert_eq!(
+            pending(&presenter),
+            Some((PresentKind::Primary, PresentReason::Launch))
+        );
+        assert!(presenter.visible);
+        assert!(!presenter.have_frame);
+    }
+
+    #[test]
+    fn requests_coalesce_while_pending() {
+        let mut presenter = Presenter::new();
+        assert!(!presenter.request(PresentReason::Show));
+        assert!(!presenter.request(PresentReason::Foreground));
+        assert_eq!(
+            pending(&presenter),
+            Some((PresentKind::Primary, PresentReason::Foreground))
+        );
+    }
+
+    #[test]
+    fn request_during_verification_starts_a_new_present() {
+        let mut presenter = Presenter::new();
+        let now = Instant::now();
+        presenter.state = PresentState::Verifying {
+            due: now + VERIFY_DELAY,
+        };
+        assert!(presenter.request(PresentReason::App));
+        assert_eq!(
+            pending(&presenter),
+            Some((PresentKind::Primary, PresentReason::App))
+        );
+
+        presenter.state = PresentState::Idle;
+        assert!(presenter.request(PresentReason::Repaint));
+    }
+
+    #[test]
+    fn request_upgrades_a_pending_verification_to_primary() {
+        let mut presenter = Presenter::new();
+        let now = Instant::now();
+        presenter.state = PresentState::Verifying { due: now };
+        presenter.poll_verification(now);
+        assert_eq!(
+            pending(&presenter),
+            Some((PresentKind::Verify, PresentReason::App))
+        );
+        assert!(!presenter.request(PresentReason::Show));
+        assert_eq!(
+            pending(&presenter),
+            Some((PresentKind::Primary, PresentReason::Show))
+        );
+    }
+
+    #[test]
+    fn verification_becomes_pending_when_due() {
+        let mut presenter = Presenter::new();
+        let now = Instant::now();
+        let due = now + VERIFY_DELAY;
+        presenter.state = PresentState::Verifying { due };
+        assert_eq!(presenter.next_deadline(), Some(due));
+
+        presenter.poll_verification(due - Duration::from_millis(1));
+        assert!(!presenter.is_pending());
+        presenter.poll_verification(due);
+        assert_eq!(
+            pending(&presenter),
+            Some((PresentKind::Verify, PresentReason::App))
+        );
+    }
+
+    #[test]
+    fn hide_drops_the_present_and_the_latch() {
+        let _latch = LATCH.lock().unwrap();
+        let mut presenter = Presenter::new();
+        request_full_present();
+        presenter.hide();
+        assert!(!presenter.visible);
+        assert!(matches!(presenter.state, PresentState::Idle));
+        assert_eq!(presenter.next_deadline(), None);
+        assert!(!FULL_PRESENT_REQUESTED.load(Ordering::Acquire));
+    }
+
+    fn backend_with_panel(top: usize) -> (Backend<MockScreen>, MockScreen) {
+        let screen = MockScreen::new(100, 200);
+        screen.state.borrow_mut().panel_height = top;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let backend = Backend::new(screen.clone(), sender, receiver);
+        (backend, screen)
+    }
+
+    #[test]
+    fn blit_copies_content_rows_and_redraws_the_panel() {
+        let (backend, screen) = backend_with_panel(20);
+        assert_eq!(backend.buffer.borrow().len(), 100 * 180);
+        backend.blit_all(&mut *backend.screen.borrow_mut());
+        assert_eq!(
+            screen.take_calls(),
+            [
+                Call::CopyRect {
+                    x: 0,
+                    y: 20,
+                    w: 100,
+                    h: 180
+                },
+                Call::DrawPanel
+            ]
+        );
+
+        let (backend, screen) = backend_with_panel(0);
+        backend.blit_all(&mut *backend.screen.borrow_mut());
+        assert_eq!(
+            screen.take_calls(),
+            [Call::CopyRect {
+                x: 0,
+                y: 0,
+                w: 100,
+                h: 200
+            }]
+        );
+    }
+
+    #[test]
+    fn updates_are_shifted_below_the_panel() {
+        let (backend, screen) = backend_with_panel(20);
+        let rect = euclid::Rect::new(euclid::Point2D::new(5, 6), euclid::Size2D::new(7, 8));
+        backend.issue(
+            &mut *backend.screen.borrow_mut(),
+            UpdateMode::Named(UpdateKind::Partial),
+            &rect,
+        );
+        assert_eq!(
+            screen.take_calls(),
+            [Call::Update {
+                kind: UpdateKind::Partial,
+                x: 5,
+                y: 26,
+                w: 7,
+                h: 8
+            }]
+        );
+    }
+
+    #[test]
+    fn panel_height_change_resizes_the_frame() {
+        let (backend, screen) = backend_with_panel(20);
+        assert!(!backend.refresh_panel_height());
+        screen.state.borrow_mut().panel_height = 30;
+        assert!(backend.refresh_panel_height());
+        assert_eq!(backend.top.get(), 30);
+        assert_eq!(backend.buffer.borrow().len(), 100 * 170);
+    }
+
+    #[test]
+    fn panel_sampling_tracks_busy_time() {
+        let mut screen = MockScreen::new(100, 200);
+        let mut presenter = Presenter::new();
+        assert_eq!(presenter.panel_poll_interval(), None);
+
+        screen.set_busy(true);
+        assert!(presenter.sample_panel(&mut screen));
+        assert_eq!(presenter.panel_poll_interval(), Some(PANEL_POLL));
+
+        screen.set_busy(false);
+        assert!(!presenter.sample_panel(&mut screen));
+        assert_eq!(presenter.panel_poll_interval(), None);
     }
 }
