@@ -138,10 +138,11 @@ impl<P: PixelFormat + Default> EinkScreen for Screen<'static, P> {
         // then always, so a panel that reports no usable height is visible.
         (self.panel_mode() == PanelMode::System).then(|| {
             format!(
-                "panel mode=system height={} (raw {:?}) fb_offset={:?}",
+                "panel mode=system height={} (raw {:?}) fb_offset={:?} show_reader={:?}",
                 Screen::panel_height(self),
                 self.panel_height_raw(),
-                self.panel_fb_offset()
+                self.panel_fb_offset(),
+                self.show_panel_reader()
             )
         })
     }

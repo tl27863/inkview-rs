@@ -172,6 +172,15 @@ fn open_framebuffer(iv: &Inkview, panel: PanelMode) -> (NonNull<icanvas_s>, c_in
         PanelMode::System => unsafe {
             iv.SetPanelType((PANEL_FLAGS_PANEL_ENABLED | PANEL_FLAGS_PANEL_NO_FB_OFFSET) as c_int);
             iv.InitPanel();
+            // A reader app (the attribute above) only gets a panel if the
+            // user's reader status bar setting is on: InitPanel loads
+            // `show_status_bar` from global.cfg, and with it 0, PanelHeight()
+            // returns 0 and nothing is drawn (seen on a PB710). Force it on
+            // for this task; this sets InkView's in-memory flag only and does
+            // not change the saved setting.
+            if let Ok(set_show) = iv.SetShowPanelReader.as_ref() {
+                set_show(1);
+            }
         },
     }
     let task = unsafe { iv.GetCurrentTask() };
@@ -830,6 +839,13 @@ impl<'a, P> Screen<'a, P> {
     pub fn panel_height_raw(&self) -> Option<c_int> {
         let f = self.iv.PanelHeight.as_ref().ok()?;
         Some(unsafe { f() })
+    }
+
+    /// `IsShowPanelReader()`: whether InkView shows the panel in reader apps.
+    /// `None` if the symbol is missing. For diagnostics.
+    pub fn show_panel_reader(&self) -> Option<bool> {
+        let f = self.iv.IsShowPanelReader.as_ref().ok()?;
+        Some(unsafe { f() } != 0)
     }
 
     /// `PanelHeightFBOffset()`: how far InkView shifts the app framebuffer
