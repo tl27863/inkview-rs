@@ -8,7 +8,7 @@ use core::fmt;
 
 use inkview::screen::{UpdFlags, UpdateKind, Waveform};
 
-use crate::eink_screen::EinkScreen;
+use crate::screen::EinkScreen;
 
 /// Environment variable with per-class overrides.
 pub const UPDATES_ENV: &str = "INKVIEW_SLINT_UPDATES";

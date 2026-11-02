@@ -6,8 +6,8 @@ use std::{
 };
 
 use crate::clock::Clock;
-use crate::eink_screen::EinkScreen;
 use crate::policy::UpdatePolicy;
+use crate::screen::EinkScreen;
 use crate::surface::Surface;
 
 /// Delay after an issued full present before verifying it with a second one.

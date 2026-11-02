@@ -1,16 +1,81 @@
-//! `EinkPresenter`: the e-ink side of a backend's event loop. A backend calls
-//! it in a fixed order each iteration and renders into its retained frame.
+//! The e-ink logic of an InkView UI backend, without a UI toolkit: full
+//! presents (screen transitions, show and resume), the damage path (partial,
+//! dynamic, finalizer, fallback), the update policy, the retained frame below
+//! the system panel, and the wake after each update.
+//!
+//! A backend owns an [`EinkPresenter`], calls it in the order documented on
+//! that type, and renders into its retained frame. `inkview-slint` is one
+//! such backend.
 
-use std::time::Duration;
+use std::{
+    sync::OnceLock,
+    time::{Duration, Instant},
+};
 
 use inkview::Event as InkEvent;
 
-use crate::clock::Clock;
-use crate::damage::DamagePath;
-use crate::eink_screen::EinkScreen;
-use crate::policy::{UPDATES_ENV, UpdatePolicy};
-use crate::present::{PresentReason, Presenter, take_full_present_request};
-use crate::surface::{Rect, Surface, fmt_rect};
+static EPOCH: OnceLock<Instant> = OnceLock::new();
+
+#[doc(hidden)]
+pub use log as __log;
+
+/// Milliseconds since the first `eink_log!` line.
+#[doc(hidden)]
+pub fn since_epoch_ms() -> u128 {
+    EPOCH.get_or_init(Instant::now).elapsed().as_millis()
+}
+
+/// Backend log line through the `log` facade (target `eink`), so the
+/// application chooses where it goes and at which level. The first line
+/// starts the `+<ms>` epoch.
+#[macro_export]
+macro_rules! eink_log {
+    ($($arg:tt)*) => {
+        $crate::__log::info!(target: "eink", "[eink +{}] {}", $crate::since_epoch_ms(), format_args!($($arg)*))
+    };
+}
+
+mod clock;
+mod damage;
+mod input;
+#[cfg(test)]
+mod mock_screen;
+mod policy;
+mod present;
+mod queue;
+mod screen;
+mod surface;
+
+pub use input::{PointerKind, content_pointer};
+pub use policy::{UPDATES_ENV, UpdateMode, UpdatePolicy};
+pub use present::{full_present_requested, request_full_present};
+pub use queue::{Disconnected, wait_events};
+pub use screen::EinkScreen;
+pub use surface::Rect;
+
+use clock::Clock;
+use damage::DamagePath;
+use present::{PresentReason, Presenter, take_full_present_request};
+use surface::{Surface, fmt_rect};
+
+/// Used when the screen reports no usable DPI (see `scale_from_dpi`).
+/// The pbanki UI was laid out for 3.0 on a 300 dpi panel.
+pub const DEFAULT_SCALE_FACTOR: f32 = 3.0;
+
+/// `dpi / 100`, so a logical pixel has the same physical size on every panel,
+/// or `DEFAULT_SCALE_FACTOR` if that is out of the plausible range (some
+/// firmware reports 0).
+///
+/// InkView's screen scale factor is not applied: it carries the firmware's UI
+/// zoom (1.16 on a PB710 at 300 dpi), which would enlarge the whole layout.
+pub fn scale_from_dpi(dpi: u32) -> f32 {
+    let scale = dpi as f32 / 100.0;
+    if (1.5..=6.0).contains(&scale) {
+        scale
+    } else {
+        DEFAULT_SCALE_FACTOR
+    }
+}
 
 /// Presenter settings beyond the screen itself.
 #[derive(Clone, Copy, Debug, Default)]
@@ -39,7 +104,7 @@ pub struct Lifecycle {
 ///
 /// 1. The backend's own timers and animations.
 /// 2. [`sample_panel`](Self::sample_panel).
-/// 3. Wait for events: no wait if [`full_present_requested`](crate::present::full_present_requested)
+/// 3. Wait for events: no wait if [`full_present_requested`]
 ///    is set, else at most the backend's timers and [`deadline`](Self::deadline) (max 1 s).
 /// 4. Drain the queue, so Show and Foreground become one present.
 /// 5. [`before_dispatch`](Self::before_dispatch) (the finalizer).
@@ -272,26 +337,6 @@ impl<S: EinkScreen> EinkPresenter<S> {
         {
             self.damage.presented();
         }
-    }
-}
-
-/// The kind of a pointer event, for [`content_pointer`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PointerKind {
-    Down,
-    Move,
-    Up,
-}
-
-/// Maps a physical pointer position to content coordinates below `top`
-/// (the system panel's rows). Presses on the panel itself are dropped, since
-/// the firmware handles them; moves and releases there are clamped to the
-/// first content row.
-pub fn content_pointer(top: i32, kind: PointerKind, x: i32, y: i32) -> Option<(i32, i32)> {
-    match kind {
-        PointerKind::Down if y < top => None,
-        PointerKind::Down => Some((x, y - top)),
-        PointerKind::Move | PointerKind::Up => Some((x, y.max(top) - top)),
     }
 }
 
@@ -547,11 +592,10 @@ mod tests {
     }
 
     #[test]
-    fn pointer_on_the_panel_rows() {
-        assert_eq!(content_pointer(20, PointerKind::Down, 5, 10), None);
-        assert_eq!(content_pointer(20, PointerKind::Down, 5, 30), Some((5, 10)));
-        assert_eq!(content_pointer(20, PointerKind::Move, 5, 10), Some((5, 0)));
-        assert_eq!(content_pointer(20, PointerKind::Up, 5, 10), Some((5, 0)));
-        assert_eq!(content_pointer(0, PointerKind::Down, 5, 0), Some((5, 0)));
+    fn scale_follows_dpi_with_fallback() {
+        assert_eq!(scale_from_dpi(300), 3.0);
+        assert_eq!(scale_from_dpi(212), 2.12);
+        assert_eq!(scale_from_dpi(0), DEFAULT_SCALE_FACTOR);
+        assert_eq!(scale_from_dpi(1000), DEFAULT_SCALE_FACTOR);
     }
 }

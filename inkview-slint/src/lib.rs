@@ -1,38 +1,18 @@
-use std::{sync::OnceLock, time::Instant};
+//! Slint platform backend for InkView. The e-ink logic (presents, damage
+//! path, update policy, retained frame) is `inkview-eink`; this crate adds
+//! the Slint window, its event loop, the render and the input mapping.
 
-static EPOCH: OnceLock<Instant> = OnceLock::new();
-
-fn since_epoch_ms() -> u128 {
-    EPOCH.get_or_init(Instant::now).elapsed().as_millis()
-}
-
-/// Backend log line through the `log` facade (target `eink`), so the
-/// application chooses where it goes and at which level.
-macro_rules! eink_log {
-    ($($arg:tt)*) => {
-        log::info!(target: "eink", "[eink +{}] {}", $crate::since_epoch_ms(), format_args!($($arg)*))
-    };
-}
-
-mod clock;
-mod damage;
-mod eink;
-mod eink_screen;
-#[cfg(test)]
-mod mock_screen;
-mod policy;
-mod present;
-mod surface;
-
-pub use eink::{EinkOptions, EinkPresenter, Lifecycle, PointerKind, content_pointer};
-pub use eink_screen::EinkScreen;
-pub use policy::{UPDATES_ENV, UpdateMode, UpdatePolicy};
-pub use present::{full_present_requested, request_full_present};
-pub use surface::Rect;
+pub use inkview_eink::{
+    EinkScreen, UPDATES_ENV, UpdateMode, UpdatePolicy, full_present_requested, request_full_present,
+};
 
 use inkview::Event as InkEvent;
 use inkview::event::Key;
 use inkview::screen::PixelFormat;
+use inkview_eink::{
+    EinkOptions, EinkPresenter, PointerKind, Rect, content_pointer, eink_log, scale_from_dpi,
+    wait_events,
+};
 use slint::platform::{
     EventLoopProxy, WindowEvent,
     software_renderer::{self as renderer, PhysicalRegion, PremultipliedRgbaColor, TargetPixel},
@@ -40,13 +20,9 @@ use slint::platform::{
 use std::{
     cell::RefCell,
     rc::Rc,
-    sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError},
-    time::Duration,
+    sync::mpsc::{Receiver, Sender},
+    time::{Duration, Instant},
 };
-
-/// Used when the screen reports no usable DPI (see `scale_from_dpi`).
-/// The pbanki UI was laid out for 3.0 on a 300 dpi panel.
-const DEFAULT_SCALE_FACTOR: f32 = 3.0;
 
 /// Render target in the task framebuffer's own pixel format (`BB8` on
 /// grayscale panels, `RGB24` on colour panels), so frames can be copied row by
@@ -102,21 +78,6 @@ impl EventLoopProxy for Proxy {
     }
 }
 
-/// `dpi / 100`, so a logical pixel has the same physical size on every panel,
-/// or `DEFAULT_SCALE_FACTOR` if that is out of the plausible range (some
-/// firmware reports 0).
-///
-/// InkView's screen scale factor is not applied: it carries the firmware's UI
-/// zoom (1.16 on a PB710 at 300 dpi), which would enlarge the whole layout.
-fn scale_from_dpi(dpi: u32) -> f32 {
-    let scale = dpi as f32 / 100.0;
-    if (1.5..=6.0).contains(&scale) {
-        scale
-    } else {
-        DEFAULT_SCALE_FACTOR
-    }
-}
-
 /// Backend settings beyond the screen itself.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BackendOptions {
@@ -151,7 +112,6 @@ impl<S: EinkScreen> Backend<S> {
         let height = screen.height();
         let scale_factor = scale_from_dpi(screen.dpi());
 
-        EPOCH.get_or_init(Instant::now);
         let trace_events = std::env::var_os("INKVIEW_SLINT_TRACE_EVENTS").is_some();
         eink_log!(
             "inkview-slint patched backend (pbanki-device-panel, presenter) \
@@ -264,23 +224,8 @@ impl<S: EinkScreen> slint::platform::Platform for Backend<S> {
             // Block for the first event, then drain everything already queued
             // so back-to-back Show/Foreground produce a single present.
             events.clear();
-            let first = match delay {
-                Some(delay) => match self.receiver.recv_timeout(delay) {
-                    Ok(evt) => Some(evt),
-                    Err(RecvTimeoutError::Timeout) => None,
-                    Err(RecvTimeoutError::Disconnected) => return Ok(()),
-                },
-                None => match self.receiver.try_recv() {
-                    Ok(evt) => Some(evt),
-                    Err(TryRecvError::Empty) => None,
-                    Err(TryRecvError::Disconnected) => return Ok(()),
-                },
-            };
-            if let Some(evt) = first {
-                events.push(evt);
-                while let Ok(evt) = self.receiver.try_recv() {
-                    events.push(evt);
-                }
+            if wait_events(&self.receiver, delay, &mut events).is_err() {
+                return Ok(());
             }
 
             eink.before_dispatch();
@@ -449,14 +394,6 @@ mod tests {
         let mut px = Pixel(RGB24(255, 255, 255));
         px.blend(color(0, 0, 128, 128));
         assert_eq!(px.0, RGB24(127, 127, 255));
-    }
-
-    #[test]
-    fn scale_follows_dpi_with_fallback() {
-        assert_eq!(scale_from_dpi(300), 3.0);
-        assert_eq!(scale_from_dpi(212), 2.12);
-        assert_eq!(scale_from_dpi(0), DEFAULT_SCALE_FACTOR);
-        assert_eq!(scale_from_dpi(1000), DEFAULT_SCALE_FACTOR);
     }
 
     #[test]

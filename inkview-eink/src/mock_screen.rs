@@ -10,7 +10,7 @@ use std::{
 use inkview::screen::{BB8, UpdFlags, UpdateKind, Waveform};
 
 use crate::clock::Clock;
-use crate::eink_screen::EinkScreen;
+use crate::screen::EinkScreen;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Call {

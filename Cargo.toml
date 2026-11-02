@@ -1,5 +1,5 @@
 [workspace]
-members = ["inkview", "inkview-eg", "inkview-slint", "examples/*"]
+members = ["inkview", "inkview-eg", "inkview-eink", "inkview-slint", "examples/*"]
 resolver = "2"
 
 [profile.release]

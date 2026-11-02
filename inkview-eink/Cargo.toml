@@ -1,0 +1,26 @@
+[package]
+name = "inkview-eink"
+version = "0.3.0"
+edition = "2024"
+
+description = "E-ink presenter for inkview-rs UI backends: full presents, damage path, update policy"
+
+license = "MIT"
+keywords = ["inkview", "pocketbook", "eink"]
+repository = "https://github.com/simmsb/inkview-rs"
+
+[dependencies]
+euclid = "0.22.14"
+log = "0.4"
+inkview = { path = "../inkview", version = "0.3.0", default-features = false }
+
+[features]
+default = ["sdk-6-11"]
+sdk-5-19 = ["inkview/sdk-5-19"]
+sdk-6-5 = ["inkview/sdk-6-5"]
+sdk-6-8 = ["inkview/sdk-6-8"]
+sdk-6-10 = ["inkview/sdk-6-10"]
+sdk-6-11 = ["inkview/sdk-6-11"]
+
+[package.metadata.docs.rs]
+features = ["sdk-6-10"]

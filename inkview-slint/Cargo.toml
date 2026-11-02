@@ -18,14 +18,15 @@ log = "0.4"
 rgb = "0.8.53"
 slint = { version = "1.18.1", default-features = false, features = ["compat-1-2", "std", "software-renderer-systemfonts", "renderer-software"] }
 inkview = { path = "../inkview", version = "0.3.0", default-features = false}
+inkview-eink = { path = "../inkview-eink", version = "0.3.0", default-features = false }
 
 [features]
 default = ["sdk-6-11"]
-sdk-5-19 = ["inkview/sdk-5-19"]
-sdk-6-5 = ["inkview/sdk-6-5"]
-sdk-6-8 = ["inkview/sdk-6-8"]
-sdk-6-10 = ["inkview/sdk-6-10"]
-sdk-6-11 = ["inkview/sdk-6-11"]
+sdk-5-19 = ["inkview/sdk-5-19", "inkview-eink/sdk-5-19"]
+sdk-6-5 = ["inkview/sdk-6-5", "inkview-eink/sdk-6-5"]
+sdk-6-8 = ["inkview/sdk-6-8", "inkview-eink/sdk-6-8"]
+sdk-6-10 = ["inkview/sdk-6-10", "inkview-eink/sdk-6-10"]
+sdk-6-11 = ["inkview/sdk-6-11", "inkview-eink/sdk-6-11"]
 
 [package.metadata.docs.rs]
 features = ["sdk-6-10"]

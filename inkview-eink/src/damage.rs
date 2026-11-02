@@ -5,8 +5,8 @@
 use std::time::{Duration, Instant};
 
 use crate::clock::Clock;
-use crate::eink_screen::EinkScreen;
 use crate::policy::UpdatePolicy;
+use crate::screen::EinkScreen;
 use crate::surface::{Rect, Surface, fmt_rect};
 
 /// Damage above this while the panel is busy is treated as a card/text

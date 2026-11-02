@@ -1,8 +1,8 @@
 //! The screen, the system panel rows above the content, and the retained
 //! frame of the content area.
 
-use crate::eink_screen::EinkScreen;
 use crate::policy::UpdateMode;
+use crate::screen::EinkScreen;
 
 pub type Rect = euclid::Rect<i32, euclid::UnknownUnit>;
 
