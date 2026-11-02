@@ -68,9 +68,11 @@ fn since_epoch_ms() -> u128 {
     EPOCH.get_or_init(Instant::now).elapsed().as_millis()
 }
 
+/// Backend log line through the `log` facade (target `eink`), so the
+/// application chooses where it goes and at which level.
 macro_rules! eink_log {
     ($($arg:tt)*) => {
-        eprintln!("[eink +{}] {}", since_epoch_ms(), format_args!($($arg)*))
+        log::info!(target: "eink", "[eink +{}] {}", since_epoch_ms(), format_args!($($arg)*))
     };
 }
 

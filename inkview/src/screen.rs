@@ -228,7 +228,7 @@ impl<'a, P: PixelFormat> Screen<'a, P> {
         let stride = fb.scanline as usize;
         let buf = fb.addr;
 
-        eprintln!(
+        log::info!(
             "[inkview] framebuffer {width}x{height} depth={} stride={stride} dpi={dpi} scale={scale}",
             fb.depth
         );
@@ -730,12 +730,12 @@ impl<'a, P> Screen<'a, P> {
             return;
         }
         let Some(fallback) = kind.fallback() else {
-            eprintln!("[inkview] {kind} update unavailable; nothing issued");
+            log::warn!("[inkview] {kind} update unavailable; nothing issued");
             return;
         };
         let bit = 1 << (kind as u32);
         if REPORTED_FALLBACKS.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
-            eprintln!("[inkview] {kind} update unavailable; using {fallback}");
+            log::warn!("[inkview] {kind} update unavailable; using {fallback}");
         }
         self.update(fallback, x, y, w as u32, h as u32);
     }

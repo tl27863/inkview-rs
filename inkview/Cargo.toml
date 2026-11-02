@@ -13,6 +13,7 @@ authors = ["Ben Simms", "flxzt"]
 
 [dependencies]
 libloading = "0.9.0"
+log = "0.4"
 thiserror = "2.0"
 num-derive = "0.5"
 num-traits = "0.2"
