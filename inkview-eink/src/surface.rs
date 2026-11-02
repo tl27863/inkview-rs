@@ -12,14 +12,17 @@ pub(crate) fn fmt_rect(r: &Rect) -> String {
 }
 
 pub(crate) struct Surface<S: EinkScreen> {
-    pub screen: S,
-    pub width: usize,
+    screen: S,
+    width: usize,
     /// Full physical height, including the panel rows.
-    pub height: usize,
+    height: usize,
     /// Rows at the top owned by the system panel; content renders below them.
-    pub top: usize,
+    top: usize,
     /// Retained frame of the content area (`width` × `height - top`).
-    pub frame: Vec<S::Pixel>,
+    frame: Vec<S::Pixel>,
+    /// `frame` holds a complete render. False at start and after the frame
+    /// is reallocated for a new panel height.
+    complete: bool,
     wake_logged: bool,
 }
 
@@ -34,8 +37,17 @@ impl<S: EinkScreen> Surface<S> {
             height,
             top,
             frame: vec![S::Pixel::default(); width * (height - top)],
+            complete: false,
             wake_logged: false,
         }
+    }
+
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    pub fn top(&self) -> usize {
+        self.top
     }
 
     /// Rows of the content area below the panel.
@@ -43,8 +55,23 @@ impl<S: EinkScreen> Surface<S> {
         self.height - self.top
     }
 
-    /// Re-reads the panel height. If it changed, resizes the retained frame;
-    /// returns true so the caller resizes its window and renders in full.
+    pub fn frame_mut(&mut self) -> &mut [S::Pixel] {
+        &mut self.frame
+    }
+
+    /// The retained frame holds a complete render, so a present can blit it.
+    pub fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    /// A render repainted the whole retained frame.
+    pub fn mark_complete(&mut self) {
+        self.complete = true;
+    }
+
+    /// Re-reads the panel height. If it changed, reallocates the retained
+    /// frame, which is then no longer complete; returns true so the caller
+    /// resizes its window and renders in full.
     pub fn refresh_panel_height(&mut self) -> bool {
         let top = self.screen.panel_height();
         if top == self.top {
@@ -53,6 +80,7 @@ impl<S: EinkScreen> Surface<S> {
         eink_log!("panel height {} -> {top}", self.top);
         self.top = top;
         self.frame = vec![S::Pixel::default(); self.width * self.content_height()];
+        self.complete = false;
         true
     }
 
@@ -214,9 +242,11 @@ mod tests {
         let (mut surface, screen) = surface_with_panel(20);
         assert!(!surface.refresh_panel_height());
         screen.state.borrow_mut().panel_height = 30;
+        surface.mark_complete();
         assert!(surface.refresh_panel_height());
         assert_eq!(surface.top, 30);
         assert_eq!(surface.content_height(), 170);
         assert_eq!(surface.frame.len(), 100 * 170);
+        assert!(!surface.is_complete());
     }
 }

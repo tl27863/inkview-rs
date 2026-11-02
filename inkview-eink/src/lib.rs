@@ -183,22 +183,22 @@ impl<S: EinkScreen> EinkPresenter<S> {
 
     /// Physical width.
     pub fn width(&self) -> usize {
-        self.surface.width
+        self.surface.width()
     }
 
     /// Size of the content area below the system panel.
     pub fn content_size(&self) -> (usize, usize) {
-        (self.surface.width, self.surface.content_height())
+        (self.surface.width(), self.surface.content_height())
     }
 
     /// Rows at the top owned by the system panel.
     pub fn top(&self) -> usize {
-        self.surface.top
+        self.surface.top()
     }
 
     /// Step 2: samples the panel (logs busy→idle).
     pub fn sample_panel(&mut self) {
-        self.presenter.sample_panel(&mut self.surface.screen);
+        self.presenter.sample_panel(&mut self.surface);
     }
 
     /// Step 3: time until the presenter needs the loop again (finalizer,
@@ -261,7 +261,7 @@ impl<S: EinkScreen> EinkPresenter<S> {
         let mut lifecycle = Lifecycle::default();
         match evt {
             InkEvent::Show | InkEvent::Repaint | InkEvent::Foreground { .. } => {
-                self.presenter.visible = true;
+                self.presenter.show();
                 if self.surface.refresh_panel_height() {
                     self.force_full_render = true;
                     lifecycle.resized = true;
@@ -289,7 +289,7 @@ impl<S: EinkScreen> EinkPresenter<S> {
     /// that requested it. Returns true if the UI must redraw.
     pub fn after_dispatch(&mut self) -> bool {
         let mut redraw = false;
-        if take_full_present_request() && self.presenter.visible {
+        if take_full_present_request() && self.presenter.is_visible() {
             // Consume after timers/event dispatch but before rendering,
             // so the full present contains the screen that requested it
             // and the normal damage path does not race it.
@@ -305,9 +305,9 @@ impl<S: EinkScreen> EinkPresenter<S> {
             self.damage.drop_waiting();
         }
 
-        if self.presenter.is_pending() && !self.presenter.have_frame {
-            // No complete frame yet. Force one full render so the re-blit
-            // below has valid pixels.
+        if self.presenter.is_pending() && !self.surface.is_complete() {
+            // No complete frame (start, or a new panel height). Force one
+            // full render so the re-blit below has valid pixels.
             self.force_full_render = true;
             redraw = true;
         }
@@ -322,7 +322,7 @@ impl<S: EinkScreen> EinkPresenter<S> {
     /// Step 9: the retained frame of the content area, `width()` pixels per
     /// row. Render into it, then call `submit_frame`.
     pub fn frame_mut(&mut self) -> &mut [S::Pixel] {
-        &mut self.surface.frame
+        self.surface.frame_mut()
     }
 
     /// Step 9: the render is done. `damage` is the changed area in content
@@ -332,10 +332,10 @@ impl<S: EinkScreen> EinkPresenter<S> {
             self.force_full_render = false;
         }
 
-        let full_damage = damage.width() >= self.surface.width as i32
+        let full_damage = damage.width() >= self.surface.width() as i32
             && damage.height() >= self.surface.content_height() as i32;
-        if !self.presenter.have_frame && (full || full_damage) {
-            self.presenter.have_frame = true;
+        if !self.surface.is_complete() && (full || full_damage) {
+            self.surface.mark_complete();
             eink_log!("first full frame rendered in {}ms", render.as_millis());
         } else if render > Duration::from_millis(500) {
             eink_log!("slow render: {}ms damage={damage:?}", render.as_millis());
@@ -401,12 +401,17 @@ mod tests {
     }
 
     fn present() -> Vec<Call> {
+        present_at(TOP)
+    }
+
+    /// The calls of a full present with `top` panel rows.
+    fn present_at(top: usize) -> Vec<Call> {
         vec![
             Call::CopyRect {
                 x: 0,
-                y: TOP,
+                y: top,
                 w: W,
-                h: H - TOP,
+                h: H - top,
             },
             Call::DrawPanel,
             Call::Update {
@@ -658,6 +663,37 @@ mod tests {
         request_full_present();
         assert_eq!(eink.wait_delay(Some(MS(30)), true), Some(Duration::ZERO));
         crate::present::take_full_present_request();
+    }
+
+    #[test]
+    fn resize_then_background_renders_in_full_before_the_next_present() {
+        let _latch = LATCH.lock().unwrap_or_else(|e| e.into_inner());
+        let (clock, screen, mut eink) = setup();
+        settle(&clock, &screen, &mut eink);
+
+        // Show with a new panel height and Background in one drain: the
+        // hidden task renders nothing.
+        screen.state.borrow_mut().panel_height = 30;
+        assert!(eink.on_event(&InkEvent::Show).resized);
+        assert!(eink.full_render_needed());
+        eink.on_event(&InkEvent::Background { pid: 0 });
+        assert!(!eink.full_render_needed());
+        assert!(!eink.after_dispatch());
+        eink.after_render();
+        assert!(screen.take_calls().is_empty());
+
+        // Foreground, same height. The reallocated frame is not complete, so
+        // the present waits for a full render instead of blitting it.
+        clock.advance(MS(1000));
+        assert!(!eink.on_event(&InkEvent::Foreground { pid: 0 }).resized);
+        assert!(eink.after_dispatch());
+        assert!(eink.full_render_needed());
+        eink.after_render();
+        assert!(screen.take_calls().is_empty());
+
+        eink.submit_frame(rect(0, 0, W as i32, (H - 30) as i32), MS(10), true);
+        eink.after_render();
+        assert_eq!(screen.take_calls(), present_at(30));
     }
 
     #[test]

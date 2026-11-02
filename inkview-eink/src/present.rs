@@ -96,10 +96,8 @@ pub(crate) enum PresentState {
 /// `PartialUpdate` regardless.
 pub(crate) struct Presenter {
     clock: Clock,
-    pub state: PresentState,
-    pub visible: bool,
-    /// The retained buffer holds a complete frame.
-    pub have_frame: bool,
+    state: PresentState,
+    visible: bool,
     /// Last sampled `IsUpdateInProcess()` and when it turned busy.
     panel_busy_since: Option<Instant>,
 }
@@ -119,7 +117,6 @@ impl Presenter {
                 next_attempt: now,
             },
             visible: true,
-            have_frame: false,
             panel_busy_since: None,
         }
     }
@@ -130,9 +127,17 @@ impl Presenter {
             clock,
             state: PresentState::Idle,
             visible: true,
-            have_frame: false,
             panel_busy_since: None,
         }
+    }
+
+    /// The task is in front again (show, resume, repaint).
+    pub fn show(&mut self) {
+        self.visible = true;
+    }
+
+    pub fn is_visible(&self) -> bool {
+        self.visible
     }
 
     pub fn is_pending(&self) -> bool {
@@ -209,8 +214,8 @@ impl Presenter {
     }
 
     /// Samples the panel and logs busy→idle transitions.
-    pub fn sample_panel<S: EinkScreen>(&mut self, screen: &mut S) -> bool {
-        let busy = screen.is_updating();
+    pub fn sample_panel<S: EinkScreen>(&mut self, surface: &mut Surface<S>) -> bool {
+        let busy = surface.is_updating();
         match (busy, self.panel_busy_since) {
             (true, None) => self.panel_busy_since = Some(self.clock.now()),
             (false, Some(since)) => {
@@ -238,8 +243,8 @@ impl Presenter {
         })
     }
 
-    /// Issues the pending present once it is due, the frame is complete and
-    /// no full render is outstanding. While the panel is busy it retries
+    /// Issues the pending present once it is due, the retained frame is
+    /// complete and no full render is outstanding. While the panel is busy it retries
     /// every 20 ms, for at most `PRESENT_WAIT_BUDGET`. Returns true if it
     /// issued the present.
     pub fn issue_due<S: EinkScreen>(
@@ -260,7 +265,7 @@ impl Presenter {
             return false;
         };
         let now = self.clock.now();
-        if now < *next_attempt || full_render_outstanding || !self.have_frame {
+        if now < *next_attempt || full_render_outstanding || !surface.is_complete() {
             return false;
         }
 
@@ -306,7 +311,7 @@ impl Presenter {
             }
         }
         // The issued update makes the panel busy again.
-        self.sample_panel(&mut surface.screen);
+        self.sample_panel(surface);
         true
     }
 }
@@ -335,7 +340,6 @@ pub(crate) mod tests {
             Some((PresentKind::Primary, PresentReason::Launch))
         );
         assert!(presenter.visible);
-        assert!(!presenter.have_frame);
     }
 
     #[test]
@@ -415,18 +419,19 @@ pub(crate) mod tests {
     #[test]
     fn panel_sampling_tracks_busy_time() {
         let clock = Clock::manual();
-        let mut screen = MockScreen::new(100, 200);
+        let screen = MockScreen::new(100, 200);
+        let mut surface = Surface::new(screen.clone());
         let mut presenter = Presenter::new(clock.clone());
         assert_eq!(presenter.panel_poll_interval(), None);
 
         screen.set_busy(true);
-        assert!(presenter.sample_panel(&mut screen));
+        assert!(presenter.sample_panel(&mut surface));
         assert_eq!(presenter.panel_poll_interval(), Some(PANEL_POLL));
         clock.advance(PANEL_POLL_SLOW_AFTER + Duration::from_millis(1));
         assert_eq!(presenter.panel_poll_interval(), Some(PANEL_POLL_SLOW));
 
         screen.set_busy(false);
-        assert!(!presenter.sample_panel(&mut screen));
+        assert!(!presenter.sample_panel(&mut surface));
         assert_eq!(presenter.panel_poll_interval(), None);
     }
 
@@ -464,7 +469,7 @@ pub(crate) mod tests {
         let (_clock, screen, mut surface, mut presenter) = setup();
         let policy = UpdatePolicy::default();
         assert!(!presenter.issue_due(&mut surface, &policy, false));
-        presenter.have_frame = true;
+        surface.mark_complete();
         assert!(!presenter.issue_due(&mut surface, &policy, true));
         assert!(screen.take_calls().is_empty());
         assert!(presenter.issue_due(&mut surface, &policy, false));
@@ -475,7 +480,7 @@ pub(crate) mod tests {
     fn present_is_verified_once_300ms_after_issue() {
         let (clock, screen, mut surface, mut presenter) = setup();
         let policy = UpdatePolicy::default();
-        presenter.have_frame = true;
+        surface.mark_complete();
         assert!(presenter.issue_due(&mut surface, &policy, false));
         screen.take_calls();
         assert_eq!(presenter.next_deadline(), Some(clock.now() + VERIFY_DELAY));
@@ -495,7 +500,7 @@ pub(crate) mod tests {
     fn present_waits_for_a_busy_panel_at_most_1200ms() {
         let (clock, screen, mut surface, mut presenter) = setup();
         let policy = UpdatePolicy::default();
-        presenter.have_frame = true;
+        surface.mark_complete();
         screen.set_busy(true);
 
         let started = clock.now();
@@ -514,7 +519,7 @@ pub(crate) mod tests {
     fn present_goes_out_as_soon_as_the_panel_is_idle() {
         let (clock, screen, mut surface, mut presenter) = setup();
         let policy = UpdatePolicy::default();
-        presenter.have_frame = true;
+        surface.mark_complete();
         screen.set_busy(true);
         assert!(!presenter.issue_due(&mut surface, &policy, false));
         clock.advance(PRESENT_RETRY);
