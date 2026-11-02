@@ -812,8 +812,9 @@ impl<'a, P> Screen<'a, P> {
     }
 
     /// Rows the firmware panel occupies at the top of the screen
-    /// (`PanelHeight()`); 0 when it is hidden. Values that are negative or
-    /// taller than a quarter of the screen are not credible and count as 0.
+    /// (`PanelHeight()`, which follows the theme and screen); 0 when it is
+    /// hidden. Negative values, and values that leave no rows for the app,
+    /// count as 0.
     pub fn panel_height(&self) -> usize {
         if self.panel == PanelMode::Hidden {
             return 0;
@@ -821,7 +822,7 @@ impl<'a, P> Screen<'a, P> {
         let Some(h) = self.panel_height_raw() else {
             return 0;
         };
-        if h > 0 && (h as usize) <= self.height / 4 {
+        if h > 0 && (h as usize) < self.height {
             h as usize
         } else {
             0
