@@ -7,8 +7,10 @@
 //! whether `UpdateEx`'s low flag bits select a `waveform_type_t`.
 //!
 //! Results go to stderr and to `$PROBE_LOG` (default
-//! `/mnt/ext1/applications/waveform-probe.log`). The app closes itself when
-//! done. Like pbAnki, updates are issued from a worker thread while
+//! `/mnt/ext1/applications/waveform-probe.log`), as do panics. The app closes
+//! itself when done. It can be copied as a bare `.app`: it re-executes itself
+//! with `GLIBC_TUNABLES=glibc.rtld.execstack=2`, which firmware 6.11.1480+
+//! needs to load libinkview.so. Like pbAnki, updates are issued from a worker thread while
 //! `InkViewMain` runs on the main thread, and each update wakes that loop.
 
 use std::fs::File;
@@ -176,9 +178,52 @@ fn probe<P: PixelFormat>(iv: &'static Inkview, mut screen: Screen<'static, P>) {
     unsafe { iv.CloseApp() };
 }
 
+/// Firmware 6.11.1480+ refuses to load system libraries that request an
+/// executable stack (libinkview.so's dependencies do) unless this glibc
+/// tunable is set. pbAnki's launcher script sets it; a bare `.app` binary has
+/// to set it itself, before the dynamic loader starts, so re-exec once.
+const EXECSTACK_TUNABLE: &str = "glibc.rtld.execstack=2";
+
+fn reexec_with_execstack_tunable() {
+    use std::os::unix::process::CommandExt;
+
+    let current = std::env::var("GLIBC_TUNABLES").unwrap_or_default();
+    if current.split(':').any(|t| t == EXECSTACK_TUNABLE) {
+        return;
+    }
+    let tunables = if current.is_empty() {
+        EXECSTACK_TUNABLE.to_owned()
+    } else {
+        format!("{current}:{EXECSTACK_TUNABLE}")
+    };
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(err) => {
+            log(format!("cannot find own executable to re-exec: {err}"));
+            return;
+        }
+    };
+    let mut args = std::env::args_os();
+    let mut command = std::process::Command::new(exe);
+    // InkView derives the task name from argv[0]; keep it.
+    if let Some(arg0) = args.next() {
+        command.arg0(arg0);
+    }
+    // Only returns on failure.
+    let err = command.args(args).env("GLIBC_TUNABLES", tunables).exec();
+    log(format!(
+        "re-exec with {EXECSTACK_TUNABLE} failed: {err}; continuing"
+    ));
+}
+
 fn main() {
     let path = std::env::var("PROBE_LOG").unwrap_or_else(|_| DEFAULT_LOG.into());
     *LOG.lock().unwrap() = File::create(&path).ok();
+    // Nobody reads stderr of a bare .app: put panics (e.g. a failed
+    // libinkview.so load) in the log file too.
+    std::panic::set_hook(Box::new(|info| log(format!("panic: {info}"))));
+
+    reexec_with_execstack_tunable();
 
     let iv: &'static Inkview = Box::leak(Box::new(inkview::load()));
     let mut started = false;

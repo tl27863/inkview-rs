@@ -73,6 +73,9 @@ impl DeviceId {
             46 => "1040dl",
             47 => "700k3p",
             48 => "1030",
+            // Not in any SDK header; reported by a PB710 on firmware
+            // U710.6.11.2124 (GetDeviceModel() = "PB710").
+            49 => "710",
             _ => return None,
         })
     }
@@ -319,8 +322,9 @@ mod tests {
         assert_eq!(DeviceId(35).name(), Some("700"));
         assert_eq!(DeviceId(48).name(), Some("1030"));
         assert_eq!(DeviceId(48).to_string(), "1030(48)");
-        assert_eq!(DeviceId(49).name(), None);
-        assert_eq!(DeviceId(49).to_string(), "unknown(49)");
+        assert_eq!(DeviceId(49).to_string(), "710(49)");
+        assert_eq!(DeviceId(50).name(), None);
+        assert_eq!(DeviceId(50).to_string(), "unknown(50)");
     }
 
     #[test]

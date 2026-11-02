@@ -809,15 +809,27 @@ impl<'a, P> Screen<'a, P> {
         if self.panel == PanelMode::Hidden {
             return 0;
         }
-        let Ok(f) = self.iv.PanelHeight.as_ref() else {
+        let Some(h) = self.panel_height_raw() else {
             return 0;
         };
-        let h = unsafe { f() };
         if h > 0 && (h as usize) <= self.height / 4 {
             h as usize
         } else {
             0
         }
+    }
+
+    /// The panel mode the screen was opened with.
+    pub fn panel_mode(&self) -> PanelMode {
+        self.panel
+    }
+
+    /// `PanelHeight()` as InkView reports it, without the hidden-mode and
+    /// sanity checks of [`Screen::panel_height`]. `None` if the symbol is
+    /// missing. For diagnostics.
+    pub fn panel_height_raw(&self) -> Option<c_int> {
+        let f = self.iv.PanelHeight.as_ref().ok()?;
+        Some(unsafe { f() })
     }
 
     /// `PanelHeightFBOffset()`: how far InkView shifts the app framebuffer

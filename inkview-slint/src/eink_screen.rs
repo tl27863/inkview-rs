@@ -3,7 +3,7 @@
 
 use core::ffi::c_int;
 
-use inkview::screen::{PixelFormat, Screen, UpdFlags, UpdateKind, Waveform};
+use inkview::screen::{PanelMode, PixelFormat, Screen, UpdFlags, UpdateKind, Waveform};
 
 /// An e-ink screen: a framebuffer plus asynchronous panel updates.
 pub trait EinkScreen {
@@ -134,10 +134,13 @@ impl<P: PixelFormat + Default> EinkScreen for Screen<'static, P> {
     }
 
     fn panel_info(&self) -> Option<String> {
-        let height = Screen::panel_height(self);
-        (height > 0).then(|| {
+        // Hidden is the default; only log when the panel was asked for, and
+        // then always, so a panel that reports no usable height is visible.
+        (self.panel_mode() == PanelMode::System).then(|| {
             format!(
-                "panel height={height} fb_offset={:?}",
+                "panel mode=system height={} (raw {:?}) fb_offset={:?}",
+                Screen::panel_height(self),
+                self.panel_height_raw(),
                 self.panel_fb_offset()
             )
         })
