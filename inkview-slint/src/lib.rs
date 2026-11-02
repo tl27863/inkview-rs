@@ -87,7 +87,9 @@ pub struct BackendOptions {
 }
 
 pub struct Backend<S: EinkScreen + 'static> {
-    eink: RefCell<EinkPresenter<S>>,
+    /// `None` while `run_event_loop` runs: the loop owns the presenter, so
+    /// nothing a Slint callback reaches through the backend can borrow it.
+    eink: RefCell<Option<EinkPresenter<S>>>,
     sender: Sender<Event>,
     receiver: Receiver<Event>,
     scale_factor: f32,
@@ -130,7 +132,7 @@ impl<S: EinkScreen> Backend<S> {
             },
         );
         Self {
-            eink: eink.into(),
+            eink: Some(eink).into(),
             sender,
             receiver,
             scale_factor,
@@ -180,10 +182,22 @@ impl<S: EinkScreen> slint::platform::Platform for Backend<S> {
         }))
     }
 
-    /// One iteration follows the order documented on [`EinkPresenter`].
+    /// Takes the presenter for the loop and puts it back afterwards, so a
+    /// later run can use it again.
     fn run_event_loop(&self) -> Result<(), slint::PlatformError> {
+        let mut eink = self.eink.take().ok_or_else(|| {
+            slint::PlatformError::Other("inkview-slint: the event loop is already running".into())
+        })?;
+        let result = self.run_loop(&mut eink);
+        self.eink.replace(Some(eink));
+        result
+    }
+}
+
+impl<S: EinkScreen> Backend<S> {
+    /// One iteration follows the order documented on [`EinkPresenter`].
+    fn run_loop(&self, eink: &mut EinkPresenter<S>) -> Result<(), slint::PlatformError> {
         let scale_factor = self.scale_factor;
-        let mut eink = self.eink.borrow_mut();
         self.resize_window(eink.content_size());
 
         self.window
