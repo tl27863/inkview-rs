@@ -1,10 +1,15 @@
 //! Test-only `EinkScreen` that records the calls the backend makes.
 
 use core::ffi::c_int;
-use std::{cell::RefCell, rc::Rc};
+use std::{
+    cell::RefCell,
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
 use inkview::screen::{BB8, UpdFlags, UpdateKind, Waveform};
 
+use crate::clock::Clock;
 use crate::eink_screen::EinkScreen;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -36,9 +41,21 @@ pub(crate) enum Call {
 #[derive(Default)]
 pub(crate) struct MockState {
     pub calls: Vec<Call>,
-    /// What `is_updating` reports.
+    /// `is_updating` reports busy while this is set.
     pub busy: bool,
     pub panel_height: usize,
+    /// With a clock: each update keeps the panel busy for `busy_for`.
+    pub clock: Option<Clock>,
+    pub busy_for: Duration,
+    busy_until: Option<Instant>,
+}
+
+impl MockState {
+    fn updated(&mut self) {
+        if let Some(clock) = &self.clock {
+            self.busy_until = Some(clock.now() + self.busy_for);
+        }
+    }
 }
 
 /// Shares its state with the test through `state`, so the test can script the
@@ -57,6 +74,16 @@ impl MockScreen {
             width,
             height,
         }
+    }
+
+    /// Each update keeps the panel busy for `busy_for` on `clock`.
+    pub fn with_update_time(self, clock: &Clock, busy_for: Duration) -> Self {
+        {
+            let mut state = self.state.borrow_mut();
+            state.clock = Some(clock.clone());
+            state.busy_for = busy_for;
+        }
+        self
     }
 
     pub fn set_busy(&self, busy: bool) {
@@ -105,10 +132,9 @@ impl EinkScreen for MockScreen {
     }
 
     fn update(&mut self, kind: UpdateKind, x: i32, y: i32, w: u32, h: u32) {
-        self.state
-            .borrow_mut()
-            .calls
-            .push(Call::Update { kind, x, y, w, h });
+        let mut state = self.state.borrow_mut();
+        state.calls.push(Call::Update { kind, x, y, w, h });
+        state.updated();
     }
 
     fn update_ex(
@@ -120,18 +146,25 @@ impl EinkScreen for MockScreen {
         w: u32,
         h: u32,
     ) -> bool {
-        self.state.borrow_mut().calls.push(Call::UpdateEx {
+        let mut state = self.state.borrow_mut();
+        state.calls.push(Call::UpdateEx {
             waveform,
             x,
             y,
             w,
             h,
         });
+        state.updated();
         true
     }
 
     fn is_updating(&mut self) -> bool {
-        self.state.borrow().busy
+        let state = self.state.borrow();
+        let timed = match (&state.clock, state.busy_until) {
+            (Some(clock), Some(until)) => clock.now() < until,
+            _ => false,
+        };
+        state.busy || timed
     }
 
     fn wake_event_loop(&self) -> Option<c_int> {

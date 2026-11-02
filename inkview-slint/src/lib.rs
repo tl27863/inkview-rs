@@ -1,70 +1,6 @@
-mod eink_screen;
-#[cfg(test)]
-mod mock_screen;
-mod policy;
+use std::{sync::OnceLock, time::Instant};
 
-pub use eink_screen::EinkScreen;
-pub use policy::{UPDATES_ENV, UpdateMode, UpdatePolicy};
-
-use inkview::Event as InkEvent;
-use inkview::event::Key;
-use inkview::screen::PixelFormat;
-use slint::platform::{
-    EventLoopProxy, WindowEvent,
-    software_renderer::{self as renderer, PhysicalRegion, PremultipliedRgbaColor, TargetPixel},
-};
-use std::{
-    cell::{Cell, RefCell},
-    rc::Rc,
-    sync::{
-        OnceLock,
-        atomic::{AtomicBool, Ordering},
-        mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError},
-    },
-    time::{Duration, Instant},
-};
-
-/// Used when the screen reports no usable DPI (see `scale_from_dpi`).
-/// The pbanki UI was laid out for 3.0 on a 300 dpi panel.
-const DEFAULT_SCALE_FACTOR: f32 = 3.0;
-
-/// Damage above this while the panel is busy is treated as a card/text
-/// transition: do not use DynamicUpdate. Button animations and other small
-/// feedback are well below this and stay on the fast dynamic path.
-const LARGE_DAMAGE_AREA: i32 = 100_000;
-
-/// Delay after an issued full present before verifying it with a second one.
-/// The first update can be discarded while InkView is still settling;
-/// verification does not delay the first frame.
-const VERIFY_DELAY: Duration = Duration::from_millis(300);
-
-/// Longest a full present waits for the panel to report idle. After this the
-/// non-flashing update is issued anyway instead of falling back to a flashing
-/// `FullUpdate`.
-const PRESENT_WAIT_BUDGET: Duration = Duration::from_millis(1200);
-
-/// Poll interval while a full present waits for the panel.
-const PRESENT_RETRY: Duration = Duration::from_millis(20);
-
-/// While the panel reports busy, wake at this interval to sample it so the
-/// busy→idle log line carries an accurate timestamp.
-const PANEL_POLL: Duration = Duration::from_millis(50);
-/// Slower sampling once the panel has been busy for longer than this.
-const PANEL_POLL_SLOW_AFTER: Duration = Duration::from_secs(10);
-const PANEL_POLL_SLOW: Duration = Duration::from_millis(500);
-
-static FULL_PRESENT_REQUESTED: AtomicBool = AtomicBool::new(false);
 static EPOCH: OnceLock<Instant> = OnceLock::new();
-
-/// Requests a non-flashing, full-frame `PartialUpdate` after the current Slint
-/// damage has been rendered. This does not invoke InkView's flashing
-/// `FullUpdate` and is intended only for genuine screen transitions.
-///
-/// Calls are coalesced. The hook used by pbanki calls this from the UI thread;
-/// the flag itself does not wake an event loop blocked in another thread.
-pub fn request_full_present() {
-    FULL_PRESENT_REQUESTED.store(true, Ordering::Release);
-}
 
 fn since_epoch_ms() -> u128 {
     EPOCH.get_or_init(Instant::now).elapsed().as_millis()
@@ -74,9 +10,44 @@ fn since_epoch_ms() -> u128 {
 /// application chooses where it goes and at which level.
 macro_rules! eink_log {
     ($($arg:tt)*) => {
-        log::info!(target: "eink", "[eink +{}] {}", since_epoch_ms(), format_args!($($arg)*))
+        log::info!(target: "eink", "[eink +{}] {}", $crate::since_epoch_ms(), format_args!($($arg)*))
     };
 }
+
+mod clock;
+mod damage;
+mod eink_screen;
+#[cfg(test)]
+mod mock_screen;
+mod policy;
+mod present;
+mod surface;
+
+pub use eink_screen::EinkScreen;
+pub use policy::{UPDATES_ENV, UpdateMode, UpdatePolicy};
+pub use present::request_full_present;
+
+use clock::Clock;
+use damage::DamagePath;
+use inkview::Event as InkEvent;
+use inkview::event::Key;
+use inkview::screen::PixelFormat;
+use present::{PresentReason, Presenter, full_present_requested, take_full_present_request};
+use slint::platform::{
+    EventLoopProxy, WindowEvent,
+    software_renderer::{self as renderer, PhysicalRegion, PremultipliedRgbaColor, TargetPixel},
+};
+use std::{
+    cell::RefCell,
+    rc::Rc,
+    sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError},
+    time::Duration,
+};
+use surface::{Rect, Surface, fmt_rect};
+
+/// Used when the screen reports no usable DPI (see `scale_from_dpi`).
+/// The pbanki UI was laid out for 3.0 on a 300 dpi panel.
+const DEFAULT_SCALE_FACTOR: f32 = 3.0;
 
 /// Render target in the task framebuffer's own pixel format (`BB8` on
 /// grayscale panels, `RGB24` on colour panels), so frames can be copied row by
@@ -96,9 +67,10 @@ impl<P: PixelFormat> TargetPixel for Pixel<P> {
     }
 }
 
-fn pixels<P>(buffer: &[Pixel<P>]) -> &[P] {
+/// The retained frame as a Slint render target.
+fn target_pixels<P>(frame: &mut [P]) -> &mut [Pixel<P>] {
     // SAFETY: `Pixel<P>` is `repr(transparent)` over `P`.
-    unsafe { core::slice::from_raw_parts(buffer.as_ptr().cast::<P>(), buffer.len()) }
+    unsafe { core::slice::from_raw_parts_mut(frame.as_mut_ptr().cast::<Pixel<P>>(), frame.len()) }
 }
 
 /// Events for the backend's event loop.
@@ -146,174 +118,6 @@ fn scale_from_dpi(dpi: u32) -> f32 {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PresentReason {
-    Launch,
-    Show,
-    Foreground,
-    Repaint,
-    App,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PresentKind {
-    /// A requested present; followed by one verification.
-    Primary,
-    /// The verification of an earlier present; not verified again.
-    Verify,
-}
-
-#[derive(Clone, Copy, Debug)]
-enum PresentState {
-    Idle,
-    Pending {
-        kind: PresentKind,
-        reason: PresentReason,
-        since: Instant,
-        attempts: u32,
-        /// When the panel was first found busy for this present.
-        waiting_since: Option<Instant>,
-        next_attempt: Instant,
-    },
-    Verifying {
-        due: Instant,
-    },
-}
-
-/// Owns the invariant "a requested full present is eventually issued and then
-/// verified once".
-///
-/// Requests from InkView events and from the application coalesce: a request
-/// while pending only updates the reason, a request while verifying starts a
-/// new pending present. A present waits for the panel to be idle for at most
-/// `PRESENT_WAIT_BUDGET`, then issues a non-flashing full-screen
-/// `PartialUpdate` regardless.
-struct Presenter {
-    state: PresentState,
-    visible: bool,
-    /// The retained buffer holds a complete frame.
-    have_frame: bool,
-    /// Last sampled `IsUpdateInProcess()` and when it turned busy.
-    panel_busy_since: Option<Instant>,
-}
-
-impl Presenter {
-    fn new() -> Self {
-        let now = Instant::now();
-        eink_log!("request reason=Launch");
-        Self {
-            state: PresentState::Pending {
-                kind: PresentKind::Primary,
-                reason: PresentReason::Launch,
-                since: now,
-                attempts: 0,
-                waiting_since: None,
-                next_attempt: now,
-            },
-            visible: true,
-            have_frame: false,
-            panel_busy_since: None,
-        }
-    }
-
-    fn is_pending(&self) -> bool {
-        matches!(self.state, PresentState::Pending { .. })
-    }
-
-    /// Returns true if this started a new pending present (rather than
-    /// coalescing into one), so callers can drop competing damage updates.
-    fn request(&mut self, new_reason: PresentReason) -> bool {
-        let now = Instant::now();
-        match &mut self.state {
-            PresentState::Pending { kind, reason, .. } => {
-                eink_log!(
-                    "request reason={new_reason:?} (coalesced into pending {reason:?} {kind:?})"
-                );
-                *reason = new_reason;
-                *kind = PresentKind::Primary;
-                false
-            }
-            PresentState::Idle | PresentState::Verifying { .. } => {
-                eink_log!("request reason={new_reason:?}");
-                self.state = PresentState::Pending {
-                    kind: PresentKind::Primary,
-                    reason: new_reason,
-                    since: now,
-                    attempts: 0,
-                    waiting_since: None,
-                    next_attempt: now,
-                };
-                true
-            }
-        }
-    }
-
-    fn hide(&mut self) {
-        if !matches!(self.state, PresentState::Idle) {
-            eink_log!("hidden; dropping {:?}", self.state_name());
-        }
-        self.visible = false;
-        self.state = PresentState::Idle;
-        FULL_PRESENT_REQUESTED.store(false, Ordering::Release);
-    }
-
-    fn state_name(&self) -> &'static str {
-        match self.state {
-            PresentState::Idle => "idle",
-            PresentState::Pending { .. } => "pending present",
-            PresentState::Verifying { .. } => "verification",
-        }
-    }
-
-    /// Promotes a due verification to a pending present.
-    fn poll_verification(&mut self, now: Instant) {
-        if let PresentState::Verifying { due } = self.state
-            && now >= due
-        {
-            self.state = PresentState::Pending {
-                kind: PresentKind::Verify,
-                reason: PresentReason::App,
-                since: now,
-                attempts: 0,
-                waiting_since: None,
-                next_attempt: now,
-            };
-        }
-    }
-
-    fn next_deadline(&self) -> Option<Instant> {
-        match self.state {
-            PresentState::Idle => None,
-            PresentState::Pending { next_attempt, .. } => Some(next_attempt),
-            PresentState::Verifying { due } => Some(due),
-        }
-    }
-
-    /// Samples the panel and logs busy→idle transitions.
-    fn sample_panel<S: EinkScreen>(&mut self, screen: &mut S) -> bool {
-        let busy = screen.is_updating();
-        match (busy, self.panel_busy_since) {
-            (true, None) => self.panel_busy_since = Some(Instant::now()),
-            (false, Some(since)) => {
-                eink_log!("panel busy→idle after {}ms", since.elapsed().as_millis());
-                self.panel_busy_since = None;
-            }
-            _ => {}
-        }
-        busy
-    }
-
-    fn panel_poll_interval(&self) -> Option<Duration> {
-        self.panel_busy_since.map(|since| {
-            if since.elapsed() > PANEL_POLL_SLOW_AFTER {
-                PANEL_POLL_SLOW
-            } else {
-                PANEL_POLL
-            }
-        })
-    }
-}
-
 /// Backend settings beyond the screen itself.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BackendOptions {
@@ -323,21 +127,13 @@ pub struct BackendOptions {
 }
 
 pub struct Backend<S: EinkScreen + 'static> {
-    screen: RefCell<S>,
+    surface: RefCell<Surface<S>>,
     sender: Sender<Event>,
     receiver: Receiver<Event>,
-    width: usize,
-    /// Full physical height, including the panel rows.
-    height: usize,
-    /// Rows at the top owned by the system panel; Slint renders below them.
-    top: Cell<usize>,
     scale_factor: f32,
     policy: UpdatePolicy,
     window: RefCell<Option<Rc<renderer::MinimalSoftwareWindow>>>,
-    /// Retained frame of the content area (`width` × `height - top`).
-    buffer: RefCell<Vec<Pixel<S::Pixel>>>,
     trace_events: bool,
-    wake_logged: Cell<bool>,
 }
 
 impl<S: EinkScreen> Backend<S> {
@@ -356,7 +152,6 @@ impl<S: EinkScreen> Backend<S> {
     ) -> Self {
         let width = screen.width();
         let height = screen.height();
-        let top = screen.panel_height();
         let scale_factor = scale_from_dpi(screen.dpi());
 
         EPOCH.get_or_init(Instant::now);
@@ -385,35 +180,24 @@ impl<S: EinkScreen> Backend<S> {
             eink_log!("{info}");
         }
 
-        let buffer = vec![Pixel::<S::Pixel>::default(); width * (height - top)];
-
         Self {
-            screen: screen.into(),
+            surface: Surface::new(screen).into(),
             sender,
             receiver,
-            width,
-            height,
-            top: Cell::new(top),
             scale_factor,
             policy,
             window: Default::default(),
-            buffer: buffer.into(),
             trace_events,
-            wake_logged: Cell::new(false),
         }
-    }
-
-    /// Rows of the content area below the panel.
-    fn content_height(&self) -> usize {
-        self.height - self.top.get()
     }
 
     /// Sizes the Slint window to the content area.
     fn resize_window(&self) {
         if let Some(window) = self.window.borrow().as_ref() {
+            let surface = self.surface.borrow();
             slint::Window::set_size(
                 window.as_ref(),
-                slint::PhysicalSize::new(self.width as u32, self.content_height() as u32)
+                slint::PhysicalSize::new(surface.width as u32, surface.content_height() as u32)
                     .to_logical(self.scale_factor),
             );
         }
@@ -422,83 +206,20 @@ impl<S: EinkScreen> Backend<S> {
     /// Re-reads the panel height. If it changed, resizes the retained buffer
     /// and the window; returns true so the caller forces a full render.
     fn refresh_panel_height(&self) -> bool {
-        let top = self.screen.borrow().panel_height();
-        if top == self.top.get() {
+        if !self.surface.borrow_mut().refresh_panel_height() {
             return false;
         }
-        eink_log!("panel height {} -> {top}", self.top.get());
-        self.top.set(top);
-        *self.buffer.borrow_mut() =
-            vec![Pixel::<S::Pixel>::default(); self.width * self.content_height()];
         self.resize_window();
         true
-    }
-
-    /// Issues `mode` for a rectangle in content coordinates.
-    fn issue(
-        &self,
-        screen: &mut S,
-        mode: UpdateMode,
-        rect: &euclid::Rect<i32, euclid::UnknownUnit>,
-    ) {
-        mode.issue(
-            screen,
-            rect.origin.x,
-            rect.origin.y + self.top.get() as i32,
-            rect.width() as u32,
-            rect.height() as u32,
-        );
     }
 
     /// Access the event sender; clone it to send in InkView events.
     pub fn event_sender(&self) -> &Sender<Event> {
         &self.sender
     }
-
-    /// Wakes InkView's main loop after a screen update.
-    ///
-    /// Updates are requested from the Slint thread while `InkViewMain` runs on
-    /// the main thread. On the PB710 an update could stay unprocessed (panel
-    /// reported idle after ~100 ms, nothing drawn) until the next touch woke
-    /// that loop. See `Screen::wake_event_loop`.
-    fn wake(&self, screen: &S) {
-        let rc = screen.wake_event_loop();
-        if !self.wake_logged.replace(true) {
-            eink_log!("waking InkView loop after updates: SendEventTo(EVT_CUSTOM) rc={rc:?}");
-        }
-    }
-
-    /// Copy the retained frame into the task framebuffer.
-    ///
-    /// InkView can blank or replace the task framebuffer while another task is
-    /// in front. Re-blitting the retained frame before a full-screen update
-    /// makes a show/resume independent of whatever currently sits in that
-    /// buffer. With a system panel, only the rows below it are copied and the
-    /// panel is redrawn, so the following full-screen update shows both.
-    fn blit_all(&self, screen: &mut S) {
-        let top = self.top.get();
-        let buffer = self.buffer.borrow();
-        screen.copy_rect(
-            0,
-            top,
-            self.width,
-            self.content_height(),
-            pixels(&buffer),
-            self.width,
-            (0, top),
-        );
-        if top > 0 {
-            screen.draw_panel();
-        }
-    }
 }
 
-/// Compact `WxH+X+Y` form for logs.
-fn fmt_rect(r: &euclid::Rect<i32, euclid::UnknownUnit>) -> String {
-    format!("{}x{}+{}+{}", r.width(), r.height(), r.origin.x, r.origin.y)
-}
-
-fn rect_from_phys(r: &PhysicalRegion) -> euclid::Rect<i32, euclid::UnknownUnit> {
+fn rect_from_phys(r: &PhysicalRegion) -> Rect {
     euclid::Rect::new(
         euclid::Point2D::new(r.bounding_box_origin().x, r.bounding_box_origin().y),
         euclid::Size2D::new(
@@ -534,15 +255,11 @@ impl<S: EinkScreen> slint::platform::Platform for Backend<S> {
             .unwrap()
             .dispatch_event(WindowEvent::ScaleFactorChanged { scale_factor });
 
+        let clock = Clock::default();
         // Normal damage path: dynamic updates while the panel is busy, then a
         // final partial update of the accumulated region once it settles.
-        let mut fulfill_dynamic_updates_after: Option<Instant> = None;
-        let mut dynamic_region_to_redraw: Option<euclid::Rect<i32, euclid::UnknownUnit>> = None;
-        let mut accumulated_updates: Option<euclid::Rect<i32, euclid::UnknownUnit>> = None;
-        let mut dynamic_finalize_retries: u32 = 0;
-        let mut last_draw_at = Instant::now();
-
-        let mut presenter = Presenter::new();
+        let mut damage_path = DamagePath::new(clock.clone());
+        let mut presenter = Presenter::new(clock.clone());
         let mut force_full_render = false;
         let mut events: Vec<Event> = Vec::new();
 
@@ -553,19 +270,19 @@ impl<S: EinkScreen> slint::platform::Platform for Backend<S> {
                 continue;
             };
 
-            presenter.sample_panel(&mut *self.screen.borrow_mut());
+            presenter.sample_panel(&mut self.surface.borrow_mut().screen);
 
-            let delay = if FULL_PRESENT_REQUESTED.load(Ordering::Acquire) {
+            let delay = if full_present_requested() {
                 // A timer may have requested a transition earlier in this
                 // iteration. Do not block before consuming that request.
                 Some(Duration::ZERO)
             } else if window.has_active_animations() {
                 None
             } else {
-                let now = Instant::now();
+                let now = clock.now();
                 [
                     slint::platform::duration_until_next_timer_update(),
-                    fulfill_dynamic_updates_after.map(|i| i.saturating_duration_since(now)),
+                    damage_path.deadline(now),
                     presenter
                         .next_deadline()
                         .map(|i| i.saturating_duration_since(now)),
@@ -599,51 +316,7 @@ impl<S: EinkScreen> slint::platform::Platform for Backend<S> {
                 }
             }
 
-            if let Some(redraw_region) = dynamic_region_to_redraw
-                && last_draw_at.elapsed() > Duration::from_millis(200)
-            {
-                let mut screen = self.screen.borrow_mut();
-
-                if screen.is_updating() {
-                    // The panel is still busy. Keep the pending region
-                    // instead of dropping the final frame; retry shortly.
-                    dynamic_finalize_retries += 1;
-                    if dynamic_finalize_retries > 100 {
-                        // The panel appears stuck; recover with a full
-                        // refresh from the current framebuffer.
-                        eink_log!(
-                            "finalize fallback: {} {}",
-                            self.policy.fallback,
-                            fmt_rect(&redraw_region)
-                        );
-                        self.issue(&mut screen, self.policy.fallback, &redraw_region);
-                        self.wake(&screen);
-                        dynamic_region_to_redraw = None;
-                        accumulated_updates = None;
-                        fulfill_dynamic_updates_after = None;
-                        dynamic_finalize_retries = 0;
-                        last_draw_at = Instant::now();
-                    } else {
-                        fulfill_dynamic_updates_after =
-                            Some(Instant::now() + Duration::from_millis(20));
-                    }
-                } else {
-                    eink_log!(
-                        "update finalize {} retries={dynamic_finalize_retries}",
-                        fmt_rect(&redraw_region)
-                    );
-                    dynamic_region_to_redraw = None;
-                    accumulated_updates = None;
-                    fulfill_dynamic_updates_after = None;
-                    dynamic_finalize_retries = 0;
-
-                    if !redraw_region.is_empty() {
-                        self.issue(&mut screen, self.policy.finalize, &redraw_region);
-                        self.wake(&screen);
-                    }
-                    last_draw_at = Instant::now();
-                }
-            }
+            damage_path.finalize(&mut self.surface.borrow_mut(), &self.policy);
 
             let mut new_present = false;
             for evt in events.drain(..) {
@@ -691,7 +364,8 @@ impl<S: EinkScreen> slint::platform::Platform for Backend<S> {
                     _ => {}
                 }
 
-                if let Some(evt) = ink_evt_to_slint(scale_factor, self.top.get() as i32, evt) {
+                let top = self.surface.borrow().top as i32;
+                if let Some(evt) = ink_evt_to_slint(scale_factor, top, evt) {
                     window.dispatch_event(evt);
                 }
             }
@@ -701,7 +375,7 @@ impl<S: EinkScreen> slint::platform::Platform for Backend<S> {
             // instead of after the next wakeup.
             slint::platform::update_timers_and_animations();
 
-            if FULL_PRESENT_REQUESTED.swap(false, Ordering::AcqRel) && presenter.visible {
+            if take_full_present_request() && presenter.visible {
                 // Consume after timers/event dispatch but before rendering,
                 // so the full present contains the screen that requested it
                 // and the normal damage path does not race it.
@@ -709,15 +383,12 @@ impl<S: EinkScreen> slint::platform::Platform for Backend<S> {
                 window.request_redraw();
             }
 
-            presenter.poll_verification(Instant::now());
+            presenter.poll_verification(clock.now());
 
             if new_present {
                 // The full present below covers the whole frame; drop any
                 // pending dynamic presentation.
-                dynamic_region_to_redraw = None;
-                accumulated_updates = None;
-                fulfill_dynamic_updates_after = None;
-                dynamic_finalize_retries = 0;
+                damage_path.drop_waiting();
             }
 
             if presenter.is_pending() && !presenter.have_frame {
@@ -732,9 +403,10 @@ impl<S: EinkScreen> slint::platform::Platform for Backend<S> {
                 if full {
                     renderer.set_repaint_buffer_type(renderer::RepaintBufferType::NewBuffer);
                 }
+                let mut surface = self.surface.borrow_mut();
+                let width = surface.width;
                 let render_started = Instant::now();
-                let mut buffer = self.buffer.borrow_mut();
-                let damage = renderer.render(buffer.as_mut_slice(), self.width);
+                let damage = renderer.render(target_pixels(&mut surface.frame), width);
                 if full {
                     renderer.set_repaint_buffer_type(renderer::RepaintBufferType::ReusedBuffer);
                     force_full_render = false;
@@ -742,8 +414,8 @@ impl<S: EinkScreen> slint::platform::Platform for Backend<S> {
                 let render_elapsed = render_started.elapsed();
 
                 let damage_rect = rect_from_phys(&damage);
-                let full_damage = damage_rect.width() >= self.width as i32
-                    && damage_rect.height() >= self.content_height() as i32;
+                let full_damage = damage_rect.width() >= width as i32
+                    && damage_rect.height() >= surface.content_height() as i32;
                 if !presenter.have_frame && (full || full_damage) {
                     presenter.have_frame = true;
                     eink_log!(
@@ -770,143 +442,15 @@ impl<S: EinkScreen> slint::platform::Platform for Backend<S> {
                     return;
                 }
 
-                let mut screen = self.screen.borrow_mut();
-                let top = self.top.get();
-                screen.copy_rect(
-                    damage_rect.origin.x.max(0) as usize,
-                    damage_rect.origin.y.max(0) as usize + top,
-                    damage_rect.width() as usize,
-                    damage_rect.height() as usize,
-                    pixels(&buffer),
-                    self.width,
-                    (0, top),
-                );
-                drop(buffer);
-
-                // Damage size selects only the dynamic/finalizer policy
-                // below. Genuine screen replacements are requested by the
-                // application instead of being inferred from damage.
-                if screen.is_updating() {
-                    if let Some(r) = accumulated_updates.as_mut() {
-                        *r = r.union(&damage_rect);
-                    } else {
-                        accumulated_updates = Some(damage_rect);
-                    }
-
-                    let accumulated_area = accumulated_updates
-                        .as_ref()
-                        .map(|r| r.width() * r.height())
-                        .unwrap_or(0);
-
-                    if accumulated_area <= LARGE_DAMAGE_AREA
-                        && last_draw_at.elapsed() > Duration::from_millis(20)
-                    {
-                        let redraw_region = accumulated_updates.take().unwrap();
-                        eink_log!(
-                            "update dynamic {} render={}ms (panel busy)",
-                            fmt_rect(&redraw_region),
-                            render_elapsed.as_millis()
-                        );
-                        self.issue(&mut screen, self.policy.busy_content, &redraw_region);
-                        self.wake(&screen);
-                        last_draw_at = Instant::now();
-                    } else {
-                        eink_log!(
-                            "damage {} render={}ms deferred to finalize (panel busy)",
-                            fmt_rect(&damage_rect),
-                            render_elapsed.as_millis()
-                        );
-                    }
-
-                    if let Some(r) = dynamic_region_to_redraw.as_mut() {
-                        *r = r.union(&damage_rect);
-                    } else {
-                        dynamic_region_to_redraw = Some(damage_rect);
-                    }
-
-                    fulfill_dynamic_updates_after =
-                        Some(Instant::now() + Duration::from_millis(200));
-                } else {
-                    eink_log!(
-                        "update partial {} render={}ms",
-                        fmt_rect(&damage_rect),
-                        render_elapsed.as_millis()
-                    );
-                    accumulated_updates = None;
-                    self.issue(&mut screen, self.policy.idle_content, &damage_rect);
-                    self.wake(&screen);
-                    last_draw_at = Instant::now();
-                }
+                damage_path.submit(&mut surface, &self.policy, damage_rect, render_elapsed);
             });
 
-            if let PresentState::Pending {
-                kind,
-                reason,
-                since,
-                attempts,
-                waiting_since,
-                next_attempt,
-            } = &mut presenter.state
-            {
-                let now = Instant::now();
-                if now >= *next_attempt && !force_full_render && presenter.have_frame {
-                    let (kind, reason, since) = (*kind, *reason, *since);
-                    let mut screen = self.screen.borrow_mut();
-                    let busy = screen.is_updating();
-                    let waited = waiting_since.map(|at| now - at).unwrap_or_default();
-
-                    if busy && waited < PRESENT_WAIT_BUDGET {
-                        if waiting_since.is_none() {
-                            *waiting_since = Some(now);
-                        }
-                        *attempts += 1;
-                        *next_attempt = now + PRESENT_RETRY;
-                    } else {
-                        let attempts = *attempts;
-                        let blit_started = Instant::now();
-                        self.blit_all(&mut screen);
-                        let blit_elapsed = blit_started.elapsed();
-                        // Whole physical screen, panel rows included.
-                        self.policy.present.issue(
-                            &mut *screen,
-                            0,
-                            0,
-                            self.width as u32,
-                            self.height as u32,
-                        );
-                        self.wake(&screen);
-                        drop(screen);
-
-                        match kind {
-                            PresentKind::Primary => {
-                                eink_log!(
-                                    "issued reason={reason:?} after={}ms waited={}ms \
-                                     attempts={attempts} busy={busy} blit={}ms",
-                                    (now - since).as_millis(),
-                                    waited.as_millis(),
-                                    blit_elapsed.as_millis()
-                                );
-                                presenter.state = PresentState::Verifying {
-                                    due: Instant::now() + VERIFY_DELAY,
-                                };
-                            }
-                            PresentKind::Verify => {
-                                eink_log!(
-                                    "verify issued waited={}ms attempts={attempts} busy={busy}",
-                                    waited.as_millis()
-                                );
-                                presenter.state = PresentState::Idle;
-                            }
-                        }
-                        // The issued update makes the panel busy again.
-                        presenter.sample_panel(&mut *self.screen.borrow_mut());
-                        dynamic_region_to_redraw = None;
-                        accumulated_updates = None;
-                        fulfill_dynamic_updates_after = None;
-                        dynamic_finalize_retries = 0;
-                        last_draw_at = Instant::now();
-                    }
-                }
+            if presenter.issue_due(
+                &mut self.surface.borrow_mut(),
+                &self.policy,
+                force_full_render,
+            ) {
+                damage_path.presented();
             }
         }
     }
@@ -971,8 +515,7 @@ fn ink_evt_to_slint(scale_factor: f32, top: i32, evt: InkEvent) -> Option<Window
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mock_screen::{Call, MockScreen};
-    use inkview::screen::{BB8, RGB24, UpdateKind};
+    use inkview::screen::{BB8, RGB24};
 
     fn color(red: u8, green: u8, blue: u8, alpha: u8) -> PremultipliedRgbaColor {
         PremultipliedRgbaColor {
@@ -1033,188 +576,9 @@ mod tests {
     }
 
     #[test]
-    fn pixel_buffer_casts_to_formats() {
-        let buffer = [Pixel(RGB24(1, 2, 3)), Pixel(RGB24(4, 5, 6))];
-        assert_eq!(pixels(&buffer), &[RGB24(1, 2, 3), RGB24(4, 5, 6)]);
-    }
-
-    /// Serializes tests that use the process-wide full-present latch.
-    static LATCH: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn pending(presenter: &Presenter) -> Option<(PresentKind, PresentReason)> {
-        match presenter.state {
-            PresentState::Pending { kind, reason, .. } => Some((kind, reason)),
-            _ => None,
-        }
-    }
-
-    #[test]
-    fn presenter_starts_with_a_launch_present() {
-        let presenter = Presenter::new();
-        assert_eq!(
-            pending(&presenter),
-            Some((PresentKind::Primary, PresentReason::Launch))
-        );
-        assert!(presenter.visible);
-        assert!(!presenter.have_frame);
-    }
-
-    #[test]
-    fn requests_coalesce_while_pending() {
-        let mut presenter = Presenter::new();
-        assert!(!presenter.request(PresentReason::Show));
-        assert!(!presenter.request(PresentReason::Foreground));
-        assert_eq!(
-            pending(&presenter),
-            Some((PresentKind::Primary, PresentReason::Foreground))
-        );
-    }
-
-    #[test]
-    fn request_during_verification_starts_a_new_present() {
-        let mut presenter = Presenter::new();
-        let now = Instant::now();
-        presenter.state = PresentState::Verifying {
-            due: now + VERIFY_DELAY,
-        };
-        assert!(presenter.request(PresentReason::App));
-        assert_eq!(
-            pending(&presenter),
-            Some((PresentKind::Primary, PresentReason::App))
-        );
-
-        presenter.state = PresentState::Idle;
-        assert!(presenter.request(PresentReason::Repaint));
-    }
-
-    #[test]
-    fn request_upgrades_a_pending_verification_to_primary() {
-        let mut presenter = Presenter::new();
-        let now = Instant::now();
-        presenter.state = PresentState::Verifying { due: now };
-        presenter.poll_verification(now);
-        assert_eq!(
-            pending(&presenter),
-            Some((PresentKind::Verify, PresentReason::App))
-        );
-        assert!(!presenter.request(PresentReason::Show));
-        assert_eq!(
-            pending(&presenter),
-            Some((PresentKind::Primary, PresentReason::Show))
-        );
-    }
-
-    #[test]
-    fn verification_becomes_pending_when_due() {
-        let mut presenter = Presenter::new();
-        let now = Instant::now();
-        let due = now + VERIFY_DELAY;
-        presenter.state = PresentState::Verifying { due };
-        assert_eq!(presenter.next_deadline(), Some(due));
-
-        presenter.poll_verification(due - Duration::from_millis(1));
-        assert!(!presenter.is_pending());
-        presenter.poll_verification(due);
-        assert_eq!(
-            pending(&presenter),
-            Some((PresentKind::Verify, PresentReason::App))
-        );
-    }
-
-    #[test]
-    fn hide_drops_the_present_and_the_latch() {
-        let _latch = LATCH.lock().unwrap();
-        let mut presenter = Presenter::new();
-        request_full_present();
-        presenter.hide();
-        assert!(!presenter.visible);
-        assert!(matches!(presenter.state, PresentState::Idle));
-        assert_eq!(presenter.next_deadline(), None);
-        assert!(!FULL_PRESENT_REQUESTED.load(Ordering::Acquire));
-    }
-
-    fn backend_with_panel(top: usize) -> (Backend<MockScreen>, MockScreen) {
-        let screen = MockScreen::new(100, 200);
-        screen.state.borrow_mut().panel_height = top;
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let backend = Backend::new(screen.clone(), sender, receiver);
-        (backend, screen)
-    }
-
-    #[test]
-    fn blit_copies_content_rows_and_redraws_the_panel() {
-        let (backend, screen) = backend_with_panel(20);
-        assert_eq!(backend.buffer.borrow().len(), 100 * 180);
-        backend.blit_all(&mut *backend.screen.borrow_mut());
-        assert_eq!(
-            screen.take_calls(),
-            [
-                Call::CopyRect {
-                    x: 0,
-                    y: 20,
-                    w: 100,
-                    h: 180
-                },
-                Call::DrawPanel
-            ]
-        );
-
-        let (backend, screen) = backend_with_panel(0);
-        backend.blit_all(&mut *backend.screen.borrow_mut());
-        assert_eq!(
-            screen.take_calls(),
-            [Call::CopyRect {
-                x: 0,
-                y: 0,
-                w: 100,
-                h: 200
-            }]
-        );
-    }
-
-    #[test]
-    fn updates_are_shifted_below_the_panel() {
-        let (backend, screen) = backend_with_panel(20);
-        let rect = euclid::Rect::new(euclid::Point2D::new(5, 6), euclid::Size2D::new(7, 8));
-        backend.issue(
-            &mut *backend.screen.borrow_mut(),
-            UpdateMode::Named(UpdateKind::Partial),
-            &rect,
-        );
-        assert_eq!(
-            screen.take_calls(),
-            [Call::Update {
-                kind: UpdateKind::Partial,
-                x: 5,
-                y: 26,
-                w: 7,
-                h: 8
-            }]
-        );
-    }
-
-    #[test]
-    fn panel_height_change_resizes_the_frame() {
-        let (backend, screen) = backend_with_panel(20);
-        assert!(!backend.refresh_panel_height());
-        screen.state.borrow_mut().panel_height = 30;
-        assert!(backend.refresh_panel_height());
-        assert_eq!(backend.top.get(), 30);
-        assert_eq!(backend.buffer.borrow().len(), 100 * 170);
-    }
-
-    #[test]
-    fn panel_sampling_tracks_busy_time() {
-        let mut screen = MockScreen::new(100, 200);
-        let mut presenter = Presenter::new();
-        assert_eq!(presenter.panel_poll_interval(), None);
-
-        screen.set_busy(true);
-        assert!(presenter.sample_panel(&mut screen));
-        assert_eq!(presenter.panel_poll_interval(), Some(PANEL_POLL));
-
-        screen.set_busy(false);
-        assert!(!presenter.sample_panel(&mut screen));
-        assert_eq!(presenter.panel_poll_interval(), None);
+    fn frame_casts_to_render_target() {
+        let mut frame = [RGB24(1, 2, 3), RGB24(4, 5, 6)];
+        target_pixels(&mut frame)[1] = Pixel(RGB24(7, 8, 9));
+        assert_eq!(frame, [RGB24(1, 2, 3), RGB24(7, 8, 9)]);
     }
 }
