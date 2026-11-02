@@ -1,5 +1,6 @@
 use crate::bindings::{
-    APPLICATION_ATTRIBUTE_APPLICATION_READER, EVT_CUSTOM, PANEL_FLAGS_PANEL_NO_FB_OFFSET,
+    APPLICATION_ATTRIBUTE_APPLICATION_READER, EVT_CUSTOM, PANEL_FLAGS_PANEL_ENABLED,
+    PANEL_FLAGS_PANEL_NO_FB_OFFSET,
 };
 use crate::error;
 use crate::{bindings::icanvas_s, bindings::Inkview};
@@ -8,6 +9,7 @@ use core::fmt::Display;
 use num_traits::{FromPrimitive, ToPrimitive};
 use std::marker::PhantomData;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// A pixel in the task framebuffer's native layout.
 ///
@@ -108,6 +110,9 @@ pub struct Screen<'a, P: 'static> {
 
     dpi: u32,
     scale: f32,
+    /// How the firmware panel was set up; `PanelHeight()` reports a height
+    /// even when the panel is hidden.
+    panel: PanelMode,
 
     _phantom: PhantomData<&'static P>,
 }
@@ -117,30 +122,57 @@ pub enum WhichScreen<'a> {
     RGB24(Screen<'a, RGB24>),
 }
 
+/// Whether the firmware's status panel (top bar with clock, battery, Wi-Fi,
+/// and the system tray it opens) is shown over the app.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PanelMode {
+    /// No panel; the app owns the whole screen.
+    #[default]
+    Hidden,
+    /// The firmware draws its panel over the top rows of the framebuffer and
+    /// handles taps on it. The app must leave [`Screen::panel_height`] rows
+    /// free and call [`Screen::draw_panel`] after redrawing the screen.
+    System,
+}
+
 impl<'a> WhichScreen<'a> {
     /// Opens the task framebuffer and picks the pixel format from its depth.
     ///
     /// Panics for depths other than 8 and 24 bits.
     pub fn new(iv: &'a Inkview) -> Self {
-        let (fb, task) = open_framebuffer(iv);
+        Self::with_panel(iv, PanelMode::Hidden)
+    }
+
+    /// Like [`WhichScreen::new`], with the firmware panel set up per `panel`.
+    pub fn with_panel(iv: &'a Inkview, panel: PanelMode) -> Self {
+        let (fb, task) = open_framebuffer(iv, panel);
         // SAFETY: InkView owns the framebuffer for the life of the task and
         // the screen holds the only Rust reference to it.
         let fb = unsafe { &mut *fb.as_ptr() };
         match fb.depth {
-            8 => WhichScreen::BB8(Screen::from_framebuffer(iv, fb, task)),
-            24 => WhichScreen::RGB24(Screen::from_framebuffer(iv, fb, task)),
+            8 => WhichScreen::BB8(Screen::from_framebuffer(iv, fb, task, panel)),
+            24 => WhichScreen::RGB24(Screen::from_framebuffer(iv, fb, task, panel)),
             depth => panic!("unsupported framebuffer depth: {depth} bits (expected 8 or 24)"),
         }
     }
 }
 
 /// Prepares the application and returns the task framebuffer.
-fn open_framebuffer(iv: &Inkview) -> (NonNull<icanvas_s>, c_int) {
+fn open_framebuffer(iv: &Inkview, panel: PanelMode) -> (NonNull<icanvas_s>, c_int) {
     unsafe {
         iv.SetCurrentApplicationAttribute(APPLICATION_ATTRIBUTE_APPLICATION_READER, 1);
     }
-    unsafe {
-        iv.SetPanelType(PANEL_FLAGS_PANEL_NO_FB_OFFSET as c_int);
+    // PANEL_NO_FB_OFFSET keeps app coordinates equal to screen coordinates
+    // either way: without it, an enabled panel shifts the app's framebuffer
+    // down by its height and rows drawn past the bottom wrap to the top.
+    match panel {
+        PanelMode::Hidden => unsafe {
+            iv.SetPanelType(PANEL_FLAGS_PANEL_NO_FB_OFFSET as c_int);
+        },
+        PanelMode::System => unsafe {
+            iv.SetPanelType((PANEL_FLAGS_PANEL_ENABLED | PANEL_FLAGS_PANEL_NO_FB_OFFSET) as c_int);
+            iv.InitPanel();
+        },
     }
     let task = unsafe { iv.GetCurrentTask() };
     // On the emulator the task framebuffer is null, so fall back to the global
@@ -167,13 +199,18 @@ impl<'a, P: PixelFormat> Screen<'a, P> {
     /// for `RGB24` on an 8-bit panel. Use [`WhichScreen::new`] to pick `P`
     /// from the framebuffer depth.
     pub fn new(iv: &'a Inkview) -> Self {
-        let (fb, task) = open_framebuffer(iv);
+        let (fb, task) = open_framebuffer(iv, PanelMode::Hidden);
         // SAFETY: see `WhichScreen::new`.
         let fb = unsafe { &mut *fb.as_ptr() };
-        Self::from_framebuffer(iv, fb, task)
+        Self::from_framebuffer(iv, fb, task, PanelMode::Hidden)
     }
 
-    fn from_framebuffer(iv: &'a Inkview, fb: &'a mut icanvas_s, task: c_int) -> Self {
+    fn from_framebuffer(
+        iv: &'a Inkview,
+        fb: &'a mut icanvas_s,
+        task: c_int,
+        panel: PanelMode,
+    ) -> Self {
         let dpi = unsafe { iv.get_screen_dpi() as u32 };
         let scale = unsafe { iv.get_screen_scale_factor() as f32 };
 
@@ -202,6 +239,7 @@ impl<'a, P: PixelFormat> Screen<'a, P> {
             task,
             dpi,
             scale,
+            panel,
             _phantom: PhantomData,
         }
     }
@@ -240,6 +278,24 @@ impl<'a, P: PixelFormat> Screen<'a, P> {
     ) {
         self.framebuffer()
             .copy_rect(x, y, w, h, src, src_stride, (0, 0));
+    }
+
+    /// Like [`Screen::copy_rect`], for a source whose first pixel is the
+    /// framebuffer pixel `src_origin` (e.g. `(0, panel_height)` for a buffer
+    /// that holds only the rows below the panel).
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy_rect_from(
+        &mut self,
+        x: usize,
+        y: usize,
+        w: usize,
+        h: usize,
+        src: &[P],
+        src_stride: usize,
+        src_origin: (usize, usize),
+    ) {
+        self.framebuffer()
+            .copy_rect(x, y, w, h, src, src_stride, src_origin);
     }
 }
 
@@ -436,6 +492,379 @@ impl<'a, P> Screen<'a, P> {
     }
 }
 
+/// InkView's named screen-update functions. The firmware picks the waveform
+/// for each; [`Screen::update_ex`] selects one explicitly on 6.10+.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum UpdateKind {
+    /// `FullUpdate`: flashing full-screen refresh (rect ignored).
+    Full,
+    /// `FullUpdateHQ`, for colour panels.
+    FullHq,
+    /// `SoftUpdate`: non-flashing full-screen refresh (rect ignored).
+    Soft,
+    /// `SoftUpdateHQ`.
+    SoftHq,
+    /// `PartialUpdate`: high-quality, non-flashing region update.
+    Partial,
+    /// `PartialUpdateHQ`, for colour panels.
+    PartialHq,
+    /// `PartialUpdateBW`.
+    PartialBw,
+    /// `PartialUpdateDU4`: four grays; can corrupt on some panels.
+    PartialDu4,
+    /// `DynamicUpdate`: fast region update for animation and feedback.
+    Dynamic,
+    /// `DynamicUpdateBW`: fast black/white region update.
+    DynamicBw,
+}
+
+impl UpdateKind {
+    pub const ALL: [UpdateKind; 10] = [
+        Self::Full,
+        Self::FullHq,
+        Self::Soft,
+        Self::SoftHq,
+        Self::Partial,
+        Self::PartialHq,
+        Self::PartialBw,
+        Self::PartialDu4,
+        Self::Dynamic,
+        Self::DynamicBw,
+    ];
+
+    /// The kebab-case name used in configuration strings.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::FullHq => "full-hq",
+            Self::Soft => "soft",
+            Self::SoftHq => "soft-hq",
+            Self::Partial => "partial",
+            Self::PartialHq => "partial-hq",
+            Self::PartialBw => "partial-bw",
+            Self::PartialDu4 => "partial-du4",
+            Self::Dynamic => "dynamic",
+            Self::DynamicBw => "dynamic-bw",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.name() == name)
+    }
+
+    /// Whether the update covers the whole screen regardless of the rect.
+    pub fn is_full_screen(self) -> bool {
+        matches!(self, Self::Full | Self::FullHq | Self::Soft | Self::SoftHq)
+    }
+
+    /// The kind used when this kind's symbol is missing.
+    fn fallback(self) -> Option<Self> {
+        match self {
+            Self::Full | Self::Partial => None,
+            Self::FullHq => Some(Self::Full),
+            Self::Soft | Self::SoftHq => Some(Self::Full),
+            Self::PartialHq | Self::PartialBw | Self::PartialDu4 | Self::Dynamic => {
+                Some(Self::Partial)
+            }
+            Self::DynamicBw => Some(Self::Dynamic),
+        }
+    }
+}
+
+impl Display for UpdateKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// `waveform_type_t` from `hwconfig.h`. `Glr16` and `Gln16` are 6.10+.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(u32)]
+pub enum Waveform {
+    Init = 0,
+    Du = 1,
+    Gc16 = 2,
+    Gc4 = 3,
+    A2 = 4,
+    Gl16 = 5,
+    A2In = 6,
+    A2Out = 7,
+    Du4 = 8,
+    Gcc16 = 9,
+    Glr16 = 10,
+    Gln16 = 11,
+}
+
+impl Waveform {
+    pub const ALL: [Waveform; 12] = [
+        Self::Init,
+        Self::Du,
+        Self::Gc16,
+        Self::Gc4,
+        Self::A2,
+        Self::Gl16,
+        Self::A2In,
+        Self::A2Out,
+        Self::Du4,
+        Self::Gcc16,
+        Self::Glr16,
+        Self::Gln16,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Init => "init",
+            Self::Du => "du",
+            Self::Gc16 => "gc16",
+            Self::Gc4 => "gc4",
+            Self::A2 => "a2",
+            Self::Gl16 => "gl16",
+            Self::A2In => "a2in",
+            Self::A2Out => "a2out",
+            Self::Du4 => "du4",
+            Self::Gcc16 => "gcc16",
+            Self::Glr16 => "glr16",
+            Self::Gln16 => "gln16",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|wf| wf.name() == name)
+    }
+}
+
+impl Display for Waveform {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// `UPD_*` flags for [`Screen::update_ex`] (`enum updflags`, 6.10+).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct UpdFlags(pub u32);
+
+impl UpdFlags {
+    pub const NONE: Self = Self(0);
+    /// Whole screen area, any waveform.
+    pub const FULLSCREEN: Self = Self(1 << 16);
+    /// Use clearing over black.
+    pub const CLEAR: Self = Self(1 << 17);
+    /// Do not refresh the area again on collision.
+    pub const NOREFRESH: Self = Self(1 << 18);
+    /// Update comes from a keyboard.
+    pub const KEYBOARD: Self = Self(1 << 19);
+    /// Wait for the previous update before this one (blocks).
+    pub const WAIT_BEFORE: Self = Self(1 << 20);
+    /// Wait for this update to complete (blocks).
+    pub const WAIT_AFTER: Self = Self(1 << 21);
+    /// Apply dithering.
+    pub const DITHER: Self = Self(1 << 22);
+    /// Do not improve line colours.
+    pub const NOIMPROVE: Self = Self(1 << 23);
+}
+
+impl core::ops::BitOr for UpdFlags {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
+/// Kinds whose missing symbol was already reported, one bit per `UpdateKind`.
+static REPORTED_FALLBACKS: AtomicU32 = AtomicU32::new(0);
+
+impl<'a, P> Screen<'a, P> {
+    /// Issues one of InkView's named updates. Full-screen kinds ignore the
+    /// rect. A kind whose symbol the firmware lacks falls back to the closest
+    /// available kind (logged once per kind).
+    pub fn update(&mut self, kind: UpdateKind, x: i32, y: i32, w: u32, h: u32) {
+        let (w, h) = (w as c_int, h as c_int);
+        let iv = self.iv;
+        let issued = match kind {
+            UpdateKind::Full => iv.FullUpdate.as_ref().ok().map(|f| unsafe { f() }),
+            UpdateKind::FullHq => iv.FullUpdateHQ.as_ref().ok().map(|f| unsafe { f() }),
+            UpdateKind::Soft => iv.SoftUpdate.as_ref().ok().map(|f| unsafe { f() }),
+            UpdateKind::SoftHq => iv.SoftUpdateHQ.as_ref().ok().map(|f| unsafe { f() }),
+            UpdateKind::Partial => iv
+                .PartialUpdate
+                .as_ref()
+                .ok()
+                .map(|f| unsafe { f(x, y, w, h) }),
+            UpdateKind::PartialHq => iv
+                .PartialUpdateHQ
+                .as_ref()
+                .ok()
+                .map(|f| unsafe { f(x, y, w, h) }),
+            UpdateKind::PartialBw => iv
+                .PartialUpdateBW
+                .as_ref()
+                .ok()
+                .map(|f| unsafe { f(x, y, w, h) }),
+            UpdateKind::PartialDu4 => iv
+                .PartialUpdateDU4
+                .as_ref()
+                .ok()
+                .map(|f| unsafe { f(x, y, w, h) }),
+            UpdateKind::Dynamic => iv
+                .DynamicUpdate
+                .as_ref()
+                .ok()
+                .map(|f| unsafe { f(x, y, w, h) }),
+            UpdateKind::DynamicBw => iv
+                .DynamicUpdateBW
+                .as_ref()
+                .ok()
+                .map(|f| unsafe { f(x, y, w, h) }),
+        };
+        if issued.is_some() {
+            return;
+        }
+        let Some(fallback) = kind.fallback() else {
+            eprintln!("[inkview] {kind} update unavailable; nothing issued");
+            return;
+        };
+        let bit = 1 << (kind as u32);
+        if REPORTED_FALLBACKS.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+            eprintln!("[inkview] {kind} update unavailable; using {fallback}");
+        }
+        self.update(fallback, x, y, w as u32, h as u32);
+    }
+
+    /// Updates a region with an explicit waveform through `UpdateEx` (SDK
+    /// 6.10+). Returns false, issuing nothing, if the firmware or the selected
+    /// bindings lack it.
+    ///
+    /// Experimental: the header documents only the `UPD_*` bits (16–23); that
+    /// the low bits carry a `waveform_type_t` is an assumption to be confirmed
+    /// with the `waveform-probe` example.
+    pub fn update_ex(
+        &mut self,
+        waveform: Waveform,
+        flags: UpdFlags,
+        x: i32,
+        y: i32,
+        w: u32,
+        h: u32,
+    ) -> bool {
+        #[cfg(any(feature = "sdk-6-10", feature = "sdk-6-11"))]
+        {
+            if let Ok(f) = self.iv.UpdateEx.as_ref() {
+                let flags = (waveform as u32 | flags.0) as c_int;
+                unsafe { f(x, y, w as c_int, h as c_int, flags) };
+                return true;
+            }
+            false
+        }
+        #[cfg(not(any(feature = "sdk-6-10", feature = "sdk-6-11")))]
+        {
+            let _ = (waveform, flags, x, y, w, h);
+            false
+        }
+    }
+
+    /// Whether [`Screen::update_ex`] can issue anything.
+    pub fn has_update_ex(&self) -> bool {
+        #[cfg(any(feature = "sdk-6-10", feature = "sdk-6-11"))]
+        {
+            self.iv.UpdateEx.is_ok()
+        }
+        #[cfg(not(any(feature = "sdk-6-10", feature = "sdk-6-11")))]
+        {
+            false
+        }
+    }
+
+    /// Fast black/white updates of a region until [`Screen::exit_a2`]
+    /// (`DynamicUpdateA2`). Meant for scrolling; redraw the region normally
+    /// afterwards.
+    pub fn enter_a2(&mut self, x: i32, y: i32, w: u32, h: u32) -> bool {
+        let Ok(f) = self.iv.DynamicUpdateA2.as_ref() else {
+            return false;
+        };
+        unsafe { f(x, y, w as c_int, h as c_int) };
+        true
+    }
+
+    /// Leaves A2 mode (`ExitUpdateA2`).
+    pub fn exit_a2(&mut self) {
+        if let Ok(f) = self.iv.ExitUpdateA2.as_ref() {
+            unsafe { f() };
+        }
+    }
+
+    /// Whether A2 mode is active (`IsInA2Update`).
+    pub fn in_a2(&self) -> bool {
+        self.iv
+            .IsInA2Update
+            .as_ref()
+            .ok()
+            .is_some_and(|f| unsafe { f() } != 0)
+    }
+
+    /// Rows the firmware panel occupies at the top of the screen
+    /// (`PanelHeight()`); 0 when it is hidden. Values that are negative or
+    /// taller than a quarter of the screen are not credible and count as 0.
+    pub fn panel_height(&self) -> usize {
+        if self.panel == PanelMode::Hidden {
+            return 0;
+        }
+        let Ok(f) = self.iv.PanelHeight.as_ref() else {
+            return 0;
+        };
+        let h = unsafe { f() };
+        if h > 0 && (h as usize) <= self.height / 4 {
+            h as usize
+        } else {
+            0
+        }
+    }
+
+    /// `PanelHeightFBOffset()`: how far InkView shifts the app framebuffer
+    /// for the panel (0 with `PANEL_NO_FB_OFFSET`). For diagnostics.
+    pub fn panel_fb_offset(&self) -> Option<c_int> {
+        #[cfg(not(feature = "sdk-5-19"))]
+        {
+            self.iv
+                .PanelHeightFBOffset
+                .as_ref()
+                .ok()
+                .map(|f| unsafe { f() })
+        }
+        #[cfg(feature = "sdk-5-19")]
+        {
+            None
+        }
+    }
+
+    /// Redraws the firmware panel into the framebuffer
+    /// (`DrawPanel(NULL, NULL, NULL, -1)`); does not update the screen.
+    /// Returns the panel height InkView reports, 0 if hidden or missing.
+    pub fn draw_panel(&mut self) -> c_int {
+        let Ok(f) = self.iv.DrawPanel.as_ref() else {
+            return 0;
+        };
+        unsafe { f(core::ptr::null(), core::ptr::null(), core::ptr::null(), -1) }
+    }
+
+    /// Duration in milliseconds of each waveform at the current panel
+    /// temperature (`GetWaveformTimes`), indexed by [`Waveform`] as `usize`.
+    /// `None` if the firmware lacks the call or reports nothing.
+    pub fn waveform_times(&self) -> Option<[u16; 16]> {
+        #[cfg(not(feature = "sdk-5-19"))]
+        {
+            let f = self.iv.GetWaveformTimes.as_ref().ok()?;
+            let mut times = [0u16; 16];
+            unsafe { f(times.as_mut_ptr()) };
+            times.iter().any(|&t| t != 0).then_some(times)
+        }
+        #[cfg(feature = "sdk-5-19")]
+        {
+            None
+        }
+    }
+}
+
 #[derive(
     Debug, Clone, Copy, PartialEq, PartialOrd, num_derive::FromPrimitive, num_derive::ToPrimitive,
 )]
@@ -513,6 +942,36 @@ impl ScreenOrientation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_and_waveform_names_round_trip() {
+        for kind in UpdateKind::ALL {
+            assert_eq!(UpdateKind::from_name(kind.name()), Some(kind));
+        }
+        for wf in Waveform::ALL {
+            assert_eq!(Waveform::from_name(wf.name()), Some(wf));
+        }
+        assert_eq!(UpdateKind::from_name("gl16"), None);
+        assert_eq!(Waveform::Gl16 as u32, 5);
+        assert_eq!(
+            (UpdFlags::DITHER | UpdFlags::NOREFRESH).0,
+            (1 << 22) | (1 << 18)
+        );
+    }
+
+    #[test]
+    fn update_fallbacks_end_at_partial_or_full() {
+        for kind in UpdateKind::ALL {
+            let mut k = kind;
+            while let Some(next) = k.fallback() {
+                k = next;
+            }
+            assert!(
+                matches!(k, UpdateKind::Partial | UpdateKind::Full),
+                "{kind}"
+            );
+        }
+    }
 
     #[test]
     fn pixel_sizes_match_bytes() {

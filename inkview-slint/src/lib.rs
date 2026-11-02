@@ -1,6 +1,12 @@
+mod eink_screen;
+mod policy;
+
+pub use eink_screen::EinkScreen;
+pub use policy::{UPDATES_ENV, UpdateMode, UpdatePolicy};
+
 use inkview::Event as InkEvent;
 use inkview::event::Key;
-use inkview::screen::{PixelFormat, Screen};
+use inkview::screen::PixelFormat;
 use slint::platform::{
     EventLoopProxy, WindowEvent,
     software_renderer::{self as renderer, PhysicalRegion, PremultipliedRgbaColor, TargetPixel},
@@ -280,7 +286,7 @@ impl Presenter {
     }
 
     /// Samples the panel and logs busy→idle transitions.
-    fn sample_panel<P>(&mut self, screen: &mut Screen<'static, P>) -> bool {
+    fn sample_panel<S: EinkScreen>(&mut self, screen: &mut S) -> bool {
         let busy = screen.is_updating();
         match (busy, self.panel_busy_since) {
             (true, None) => self.panel_busy_since = Some(Instant::now()),
@@ -304,43 +310,78 @@ impl Presenter {
     }
 }
 
-pub struct Backend<P: 'static> {
-    screen: RefCell<Screen<'static, P>>,
+/// Backend settings beyond the screen itself.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BackendOptions {
+    /// Update mode per class of screen change. `INKVIEW_SLINT_UPDATES`
+    /// overrides individual classes on top of this.
+    pub policy: UpdatePolicy,
+}
+
+pub struct Backend<S: EinkScreen + 'static> {
+    screen: RefCell<S>,
     sender: Sender<Event>,
     receiver: Receiver<Event>,
     width: usize,
+    /// Full physical height, including the panel rows.
     height: usize,
+    /// Rows at the top owned by the system panel; Slint renders below them.
+    top: Cell<usize>,
     scale_factor: f32,
+    policy: UpdatePolicy,
     window: RefCell<Option<Rc<renderer::MinimalSoftwareWindow>>>,
-    buffer: RefCell<Vec<Pixel<P>>>,
+    /// Retained frame of the content area (`width` × `height - top`).
+    buffer: RefCell<Vec<Pixel<S::Pixel>>>,
     trace_events: bool,
     wake_logged: Cell<bool>,
 }
 
-impl<P: PixelFormat + Default> Backend<P> {
+impl<S: EinkScreen> Backend<S> {
     /// Create a new backend. `sender` and `receiver` must be of the same
     /// channel; InkView events are sent into it as `Event::InkviewEvent`.
-    pub fn new(
-        screen: Screen<'static, P>,
+    pub fn new(screen: S, sender: Sender<Event>, receiver: Receiver<Event>) -> Self {
+        Self::with_options(screen, sender, receiver, BackendOptions::default())
+    }
+
+    /// Like [`Backend::new`], with explicit options.
+    pub fn with_options(
+        screen: S,
         sender: Sender<Event>,
         receiver: Receiver<Event>,
+        options: BackendOptions,
     ) -> Self {
         let width = screen.width();
         let height = screen.height();
+        let top = screen.panel_height();
         let scale_factor = scale_from_dpi(screen.dpi());
 
         EPOCH.get_or_init(Instant::now);
         let trace_events = std::env::var_os("INKVIEW_SLINT_TRACE_EVENTS").is_some();
         eink_log!(
-            "inkview-slint patched backend (pbanki-upstream-master, presenter) \
+            "inkview-slint patched backend (pbanki-device-panel, presenter) \
              {width}x{height} {}-byte pixels scale={scale_factor} (dpi={} screen scale={}){}",
-            P::BYTES,
+            S::Pixel::BYTES,
             screen.dpi(),
             screen.scale(),
             if trace_events { ", tracing events" } else { "" }
         );
 
-        let buffer = vec![Pixel::<P>::default(); width * height];
+        let mut policy = options.policy;
+        if let Ok(spec) = std::env::var(UPDATES_ENV) {
+            for ignored in policy.apply_overrides(&spec) {
+                eink_log!("{UPDATES_ENV}: ignored {ignored}");
+            }
+        }
+        eink_log!("update policy: {policy}");
+        match screen.waveform_times() {
+            Some(times) => eink_log!("waveform times (ms, by waveform id): {times:?}"),
+            None => eink_log!("waveform times unavailable"),
+        }
+        if let Some(info) = screen.panel_info() {
+            eink_log!("{info}");
+        }
+
+        let buffer = vec![Pixel::<S::Pixel>::default(); width * (height - top)];
 
         Self {
             screen: screen.into(),
@@ -348,12 +389,61 @@ impl<P: PixelFormat + Default> Backend<P> {
             receiver,
             width,
             height,
+            top: Cell::new(top),
             scale_factor,
+            policy,
             window: Default::default(),
             buffer: buffer.into(),
             trace_events,
             wake_logged: Cell::new(false),
         }
+    }
+
+    /// Rows of the content area below the panel.
+    fn content_height(&self) -> usize {
+        self.height - self.top.get()
+    }
+
+    /// Sizes the Slint window to the content area.
+    fn resize_window(&self) {
+        if let Some(window) = self.window.borrow().as_ref() {
+            slint::Window::set_size(
+                window.as_ref(),
+                slint::PhysicalSize::new(self.width as u32, self.content_height() as u32)
+                    .to_logical(self.scale_factor),
+            );
+        }
+    }
+
+    /// Re-reads the panel height. If it changed, resizes the retained buffer
+    /// and the window; returns true so the caller forces a full render.
+    fn refresh_panel_height(&self) -> bool {
+        let top = self.screen.borrow().panel_height();
+        if top == self.top.get() {
+            return false;
+        }
+        eink_log!("panel height {} -> {top}", self.top.get());
+        self.top.set(top);
+        *self.buffer.borrow_mut() =
+            vec![Pixel::<S::Pixel>::default(); self.width * self.content_height()];
+        self.resize_window();
+        true
+    }
+
+    /// Issues `mode` for a rectangle in content coordinates.
+    fn issue(
+        &self,
+        screen: &mut S,
+        mode: UpdateMode,
+        rect: &euclid::Rect<i32, euclid::UnknownUnit>,
+    ) {
+        mode.issue(
+            screen,
+            rect.origin.x,
+            rect.origin.y + self.top.get() as i32,
+            rect.width() as u32,
+            rect.height() as u32,
+        );
     }
 
     /// Access the event sender; clone it to send in InkView events.
@@ -367,7 +457,7 @@ impl<P: PixelFormat + Default> Backend<P> {
     /// the main thread. On the PB710 an update could stay unprocessed (panel
     /// reported idle after ~100 ms, nothing drawn) until the next touch woke
     /// that loop. See `Screen::wake_event_loop`.
-    fn wake(&self, screen: &Screen<'static, P>) {
+    fn wake(&self, screen: &S) {
         let rc = screen.wake_event_loop();
         if !self.wake_logged.replace(true) {
             eink_log!("waking InkView loop after updates: SendEventTo(EVT_CUSTOM) rc={rc:?}");
@@ -379,10 +469,23 @@ impl<P: PixelFormat + Default> Backend<P> {
     /// InkView can blank or replace the task framebuffer while another task is
     /// in front. Re-blitting the retained frame before a full-screen update
     /// makes a show/resume independent of whatever currently sits in that
-    /// buffer.
-    fn blit_all(&self, screen: &mut Screen<'static, P>) {
+    /// buffer. With a system panel, only the rows below it are copied and the
+    /// panel is redrawn, so the following full-screen update shows both.
+    fn blit_all(&self, screen: &mut S) {
+        let top = self.top.get();
         let buffer = self.buffer.borrow();
-        screen.copy_rect(0, 0, self.width, self.height, pixels(&buffer), self.width);
+        screen.copy_rect(
+            0,
+            top,
+            self.width,
+            self.content_height(),
+            pixels(&buffer),
+            self.width,
+            (0, top),
+        );
+        if top > 0 {
+            screen.draw_panel();
+        }
     }
 }
 
@@ -401,7 +504,7 @@ fn rect_from_phys(r: &PhysicalRegion) -> euclid::Rect<i32, euclid::UnknownUnit> 
     )
 }
 
-impl<P: PixelFormat + Default> slint::platform::Platform for Backend<P> {
+impl<S: EinkScreen> slint::platform::Platform for Backend<S> {
     fn create_window_adapter(
         &self,
     ) -> Result<Rc<dyn slint::platform::WindowAdapter>, slint::PlatformError> {
@@ -419,11 +522,7 @@ impl<P: PixelFormat + Default> slint::platform::Platform for Backend<P> {
 
     fn run_event_loop(&self) -> Result<(), slint::PlatformError> {
         let scale_factor = self.scale_factor;
-        slint::Window::set_size(
-            self.window.borrow().as_ref().unwrap().as_ref(),
-            slint::PhysicalSize::new(self.width as u32, self.height as u32)
-                .to_logical(scale_factor),
-        );
+        self.resize_window();
 
         self.window
             .borrow()
@@ -450,7 +549,7 @@ impl<P: PixelFormat + Default> slint::platform::Platform for Backend<P> {
                 continue;
             };
 
-            presenter.sample_panel(&mut self.screen.borrow_mut());
+            presenter.sample_panel(&mut *self.screen.borrow_mut());
 
             let delay = if FULL_PRESENT_REQUESTED.load(Ordering::Acquire) {
                 // A timer may have requested a transition earlier in this
@@ -508,8 +607,12 @@ impl<P: PixelFormat + Default> slint::platform::Platform for Backend<P> {
                     if dynamic_finalize_retries > 100 {
                         // The panel appears stuck; recover with a full
                         // refresh from the current framebuffer.
-                        eink_log!("finalize fallback: FullUpdate {}", fmt_rect(&redraw_region));
-                        screen.full_update();
+                        eink_log!(
+                            "finalize fallback: {} {}",
+                            self.policy.fallback,
+                            fmt_rect(&redraw_region)
+                        );
+                        self.issue(&mut screen, self.policy.fallback, &redraw_region);
                         self.wake(&screen);
                         dynamic_region_to_redraw = None;
                         accumulated_updates = None;
@@ -530,13 +633,10 @@ impl<P: PixelFormat + Default> slint::platform::Platform for Backend<P> {
                     fulfill_dynamic_updates_after = None;
                     dynamic_finalize_retries = 0;
 
-                    screen.partial_update(
-                        redraw_region.origin.x,
-                        redraw_region.origin.y,
-                        redraw_region.width() as u32,
-                        redraw_region.height() as u32,
-                    );
-                    self.wake(&screen);
+                    if !redraw_region.is_empty() {
+                        self.issue(&mut screen, self.policy.finalize, &redraw_region);
+                        self.wake(&screen);
+                    }
                     last_draw_at = Instant::now();
                 }
             }
@@ -568,6 +668,9 @@ impl<P: PixelFormat + Default> slint::platform::Platform for Backend<P> {
                 match evt {
                     InkEvent::Show | InkEvent::Repaint | InkEvent::Foreground { .. } => {
                         presenter.visible = true;
+                        if self.refresh_panel_height() {
+                            force_full_render = true;
+                        }
                         let reason = match evt {
                             InkEvent::Show => PresentReason::Show,
                             InkEvent::Repaint => PresentReason::Repaint,
@@ -584,7 +687,7 @@ impl<P: PixelFormat + Default> slint::platform::Platform for Backend<P> {
                     _ => {}
                 }
 
-                if let Some(evt) = ink_evt_to_slint(scale_factor, evt) {
+                if let Some(evt) = ink_evt_to_slint(scale_factor, self.top.get() as i32, evt) {
                     window.dispatch_event(evt);
                 }
             }
@@ -636,7 +739,7 @@ impl<P: PixelFormat + Default> slint::platform::Platform for Backend<P> {
 
                 let damage_rect = rect_from_phys(&damage);
                 let full_damage = damage_rect.width() >= self.width as i32
-                    && damage_rect.height() >= self.height as i32;
+                    && damage_rect.height() >= self.content_height() as i32;
                 if !presenter.have_frame && (full || full_damage) {
                     presenter.have_frame = true;
                     eink_log!(
@@ -657,16 +760,22 @@ impl<P: PixelFormat + Default> slint::platform::Platform for Backend<P> {
                     return;
                 }
 
+                if damage_rect.is_empty() {
+                    // Nothing changed on screen (e.g. a tap on a control
+                    // without pressed styles); issue no zero-area update.
+                    return;
+                }
+
                 let mut screen = self.screen.borrow_mut();
-                let origin = damage.bounding_box_origin();
-                let size = damage.bounding_box_size();
+                let top = self.top.get();
                 screen.copy_rect(
-                    origin.x.max(0) as usize,
-                    origin.y.max(0) as usize,
-                    size.width as usize,
-                    size.height as usize,
+                    damage_rect.origin.x.max(0) as usize,
+                    damage_rect.origin.y.max(0) as usize + top,
+                    damage_rect.width() as usize,
+                    damage_rect.height() as usize,
                     pixels(&buffer),
                     self.width,
+                    (0, top),
                 );
                 drop(buffer);
 
@@ -694,12 +803,7 @@ impl<P: PixelFormat + Default> slint::platform::Platform for Backend<P> {
                             fmt_rect(&redraw_region),
                             render_elapsed.as_millis()
                         );
-                        screen.dynamic_update(
-                            redraw_region.origin.x,
-                            redraw_region.origin.y,
-                            redraw_region.width() as u32,
-                            redraw_region.height() as u32,
-                        );
+                        self.issue(&mut screen, self.policy.busy_content, &redraw_region);
                         self.wake(&screen);
                         last_draw_at = Instant::now();
                     } else {
@@ -725,7 +829,7 @@ impl<P: PixelFormat + Default> slint::platform::Platform for Backend<P> {
                         render_elapsed.as_millis()
                     );
                     accumulated_updates = None;
-                    screen.partial_update(origin.x, origin.y, size.width, size.height);
+                    self.issue(&mut screen, self.policy.idle_content, &damage_rect);
                     self.wake(&screen);
                     last_draw_at = Instant::now();
                 }
@@ -758,7 +862,14 @@ impl<P: PixelFormat + Default> slint::platform::Platform for Backend<P> {
                         let blit_started = Instant::now();
                         self.blit_all(&mut screen);
                         let blit_elapsed = blit_started.elapsed();
-                        screen.partial_update(0, 0, self.width as u32, self.height as u32);
+                        // Whole physical screen, panel rows included.
+                        self.policy.present.issue(
+                            &mut *screen,
+                            0,
+                            0,
+                            self.width as u32,
+                            self.height as u32,
+                        );
                         self.wake(&screen);
                         drop(screen);
 
@@ -784,7 +895,7 @@ impl<P: PixelFormat + Default> slint::platform::Platform for Backend<P> {
                             }
                         }
                         // The issued update makes the panel busy again.
-                        presenter.sample_panel(&mut self.screen.borrow_mut());
+                        presenter.sample_panel(&mut *self.screen.borrow_mut());
                         dynamic_region_to_redraw = None;
                         accumulated_updates = None;
                         fulfill_dynamic_updates_after = None;
@@ -817,17 +928,23 @@ fn ink_key_to_slint(key: Key) -> Option<slint::platform::Key> {
     }
 }
 
-fn ink_evt_to_slint(scale_factor: f32, evt: InkEvent) -> Option<WindowEvent> {
+/// Maps an InkView event to Slint. Pointer positions are shifted up by `top`
+/// (the system panel's rows); presses on the panel itself are not forwarded,
+/// since the firmware handles them.
+fn ink_evt_to_slint(scale_factor: f32, top: i32, evt: InkEvent) -> Option<WindowEvent> {
+    let position =
+        |x: i32, y: i32| slint::PhysicalPosition { x, y: y - top }.to_logical(scale_factor);
     let evt = match evt {
+        InkEvent::PointerDown { y, .. } if y < top => return None,
         InkEvent::PointerDown { x, y } => WindowEvent::PointerPressed {
-            position: slint::PhysicalPosition { x, y }.to_logical(scale_factor),
+            position: position(x, y),
             button: slint::platform::PointerEventButton::Left,
         },
         InkEvent::PointerMove { x, y } => WindowEvent::PointerMoved {
-            position: slint::PhysicalPosition { x, y }.to_logical(scale_factor),
+            position: position(x, y.max(top)),
         },
         InkEvent::PointerUp { x, y } => WindowEvent::PointerReleased {
-            position: slint::PhysicalPosition { x, y }.to_logical(scale_factor),
+            position: position(x, y.max(top)),
             button: slint::platform::PointerEventButton::Left,
         },
         InkEvent::Foreground { .. } => WindowEvent::WindowActiveChanged(true),

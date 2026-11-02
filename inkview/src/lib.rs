@@ -2,6 +2,7 @@
 compile_error!("No SDK selected, enable one of the 'sdk-*' features.");
 
 pub mod bindings;
+pub mod device;
 pub mod dialogs;
 pub mod error;
 pub mod event;
