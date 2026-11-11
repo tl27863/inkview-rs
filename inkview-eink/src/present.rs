@@ -52,6 +52,31 @@ pub(crate) fn take_full_present_request() -> bool {
     FULL_PRESENT_REQUESTED.swap(false, Ordering::AcqRel)
 }
 
+static FULL_REFRESH_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Requests one flashing full refresh (the `fallback` class of the update
+/// policy, `FullUpdate` by default) after the UI's current damage has been
+/// rendered. It clears ghosting. The refresh takes the place of the
+/// non-flashing update of that frame, and no verification present follows
+/// it.
+///
+/// Calls are coalesced, also with [`request_full_present`]: then one
+/// flashing present goes out, and it is verified as a full present is. Like
+/// `request_full_present`, call it from the UI thread.
+pub fn request_full_refresh() {
+    FULL_REFRESH_REQUESTED.store(true, Ordering::Release);
+}
+
+/// Whether the application requested a full refresh that is not consumed yet.
+pub fn full_refresh_requested() -> bool {
+    FULL_REFRESH_REQUESTED.load(Ordering::Acquire)
+}
+
+/// Consumes the application's refresh request.
+pub(crate) fn take_full_refresh_request() -> bool {
+    FULL_REFRESH_REQUESTED.swap(false, Ordering::AcqRel)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PresentReason {
     Launch,
@@ -59,6 +84,8 @@ pub(crate) enum PresentReason {
     Foreground,
     Repaint,
     App,
+    /// `request_full_refresh`: a flashing refresh without verification.
+    Refresh,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,6 +102,8 @@ pub(crate) enum PresentState {
     Pending {
         kind: PresentKind,
         reason: PresentReason,
+        /// Issue the flashing `fallback` mode, not the `present` mode.
+        flash: bool,
         since: Instant,
         attempts: u32,
         /// When the panel was first found busy for this present.
@@ -111,6 +140,7 @@ impl Presenter {
             state: PresentState::Pending {
                 kind: PresentKind::Primary,
                 reason: PresentReason::Launch,
+                flash: false,
                 since: now,
                 attempts: 0,
                 waiting_since: None,
@@ -162,6 +192,48 @@ impl Presenter {
                 self.state = PresentState::Pending {
                     kind: PresentKind::Primary,
                     reason: new_reason,
+                    flash: false,
+                    since: now,
+                    attempts: 0,
+                    waiting_since: None,
+                    next_attempt: now,
+                };
+                true
+            }
+        }
+    }
+
+    /// Makes the next present a flashing full refresh. A pending present
+    /// keeps its reason and its verification and only changes its update
+    /// mode. Else this starts a present with the reason `Refresh`, which is
+    /// not verified; it replaces a waiting verification, because the refresh
+    /// shows the whole retained frame again.
+    ///
+    /// Returns true if this started a new pending present, as `request`.
+    pub fn request_refresh(&mut self) -> bool {
+        let now = self.clock.now();
+        match &mut self.state {
+            PresentState::Pending {
+                kind,
+                reason,
+                flash,
+                ..
+            } => {
+                eink_log!("request refresh (coalesced into pending {reason:?} {kind:?})");
+                if *kind == PresentKind::Verify {
+                    // The refresh is the verification.
+                    *kind = PresentKind::Primary;
+                    *reason = PresentReason::Refresh;
+                }
+                *flash = true;
+                false
+            }
+            PresentState::Idle | PresentState::Verifying { .. } => {
+                eink_log!("request reason=Refresh");
+                self.state = PresentState::Pending {
+                    kind: PresentKind::Primary,
+                    reason: PresentReason::Refresh,
+                    flash: true,
                     since: now,
                     attempts: 0,
                     waiting_since: None,
@@ -179,6 +251,7 @@ impl Presenter {
         self.visible = false;
         self.state = PresentState::Idle;
         FULL_PRESENT_REQUESTED.store(false, Ordering::Release);
+        FULL_REFRESH_REQUESTED.store(false, Ordering::Release);
     }
 
     fn state_name(&self) -> &'static str {
@@ -197,6 +270,7 @@ impl Presenter {
             self.state = PresentState::Pending {
                 kind: PresentKind::Verify,
                 reason: PresentReason::App,
+                flash: false,
                 since: now,
                 attempts: 0,
                 waiting_since: None,
@@ -256,6 +330,7 @@ impl Presenter {
         let PresentState::Pending {
             kind,
             reason,
+            flash,
             since,
             attempts,
             waiting_since,
@@ -269,7 +344,7 @@ impl Presenter {
             return false;
         }
 
-        let (kind, reason, since) = (*kind, *reason, *since);
+        let (kind, reason, flash, since) = (*kind, *reason, *flash, *since);
         let busy = surface.is_updating();
         let waited = waiting_since.map(|at| now - at).unwrap_or_default();
 
@@ -286,20 +361,30 @@ impl Presenter {
         let blit_started = self.clock.now();
         surface.blit_all();
         let blit_elapsed = self.clock.now() - blit_started;
-        surface.issue_full_screen(policy.present);
+        surface.issue_full_screen(if flash {
+            policy.fallback
+        } else {
+            policy.present
+        });
         surface.wake();
 
         match kind {
             PresentKind::Primary => {
                 eink_log!(
-                    "issued reason={reason:?} after={}ms waited={}ms \
+                    "issued reason={reason:?} flash={flash} after={}ms waited={}ms \
                      attempts={attempts} busy={busy} blit={}ms",
                     (now - since).as_millis(),
                     waited.as_millis(),
                     blit_elapsed.as_millis()
                 );
-                self.state = PresentState::Verifying {
-                    due: self.clock.now() + VERIFY_DELAY,
+                self.state = if reason == PresentReason::Refresh {
+                    // A verification 300 ms later would fight the flashing
+                    // update, which takes longer than that.
+                    PresentState::Idle
+                } else {
+                    PresentState::Verifying {
+                        due: self.clock.now() + VERIFY_DELAY,
+                    }
                 };
             }
             PresentKind::Verify => {
@@ -526,5 +611,121 @@ pub(crate) mod tests {
         screen.set_busy(false);
         assert!(presenter.issue_due(&mut surface, &policy, false));
         assert_eq!(screen.take_calls(), present_calls());
+    }
+
+    fn refresh_calls() -> Vec<Call> {
+        let mut calls = present_calls();
+        calls[2] = Call::Update {
+            kind: UpdateKind::Full,
+            x: 0,
+            y: 0,
+            w: 100,
+            h: 200,
+        };
+        calls
+    }
+
+    /// A presenter whose launch present and verification are done.
+    fn setup_idle() -> (Clock, MockScreen, Surface<MockScreen>, Presenter) {
+        let (clock, screen, mut surface, mut presenter) = setup();
+        surface.mark_complete();
+        presenter.state = PresentState::Idle;
+        (clock, screen, surface, presenter)
+    }
+
+    #[test]
+    fn refresh_is_one_flashing_present_without_verification() {
+        let (clock, screen, mut surface, mut presenter) = setup_idle();
+        let policy = UpdatePolicy::default();
+
+        assert!(presenter.request_refresh());
+        assert_eq!(
+            pending(&presenter),
+            Some((PresentKind::Primary, PresentReason::Refresh))
+        );
+        assert!(presenter.issue_due(&mut surface, &policy, false));
+        assert_eq!(screen.take_calls(), refresh_calls());
+        assert!(matches!(presenter.state, PresentState::Idle));
+        assert_eq!(presenter.next_deadline(), None);
+
+        clock.advance(VERIFY_DELAY);
+        presenter.poll_verification(clock.now());
+        assert!(!presenter.issue_due(&mut surface, &policy, false));
+        assert!(screen.take_calls().is_empty());
+    }
+
+    #[test]
+    fn refresh_waits_for_the_panel_as_a_present_does() {
+        let (clock, screen, mut surface, mut presenter) = setup_idle();
+        let policy = UpdatePolicy::default();
+        screen.set_busy(true);
+        presenter.request_refresh();
+        assert!(!presenter.issue_due(&mut surface, &policy, false));
+        clock.advance(PRESENT_RETRY);
+        screen.set_busy(false);
+        assert!(presenter.issue_due(&mut surface, &policy, false));
+        assert_eq!(screen.take_calls(), refresh_calls());
+    }
+
+    #[test]
+    fn refresh_replaces_a_waiting_verification() {
+        let (clock, screen, mut surface, mut presenter) = setup_idle();
+        let policy = UpdatePolicy::default();
+        presenter.state = PresentState::Verifying {
+            due: clock.now() + VERIFY_DELAY,
+        };
+
+        assert!(presenter.request_refresh());
+        assert!(presenter.issue_due(&mut surface, &policy, false));
+        assert_eq!(screen.take_calls(), refresh_calls());
+        assert!(matches!(presenter.state, PresentState::Idle));
+
+        // Also a verification that is pending already.
+        presenter.state = PresentState::Verifying { due: clock.now() };
+        presenter.poll_verification(clock.now());
+        assert!(!presenter.request_refresh());
+        assert!(presenter.issue_due(&mut surface, &policy, false));
+        assert_eq!(screen.take_calls(), refresh_calls());
+        assert!(matches!(presenter.state, PresentState::Idle));
+    }
+
+    #[test]
+    fn refresh_and_present_together_flash_once_and_verify() {
+        let (clock, screen, mut surface, mut presenter) = setup_idle();
+        let policy = UpdatePolicy::default();
+
+        // In both orders, the present keeps its reason and verification.
+        assert!(presenter.request(PresentReason::App));
+        assert!(!presenter.request_refresh());
+        assert_eq!(
+            pending(&presenter),
+            Some((PresentKind::Primary, PresentReason::App))
+        );
+        assert!(presenter.issue_due(&mut surface, &policy, false));
+        assert_eq!(screen.take_calls(), refresh_calls());
+        assert!(matches!(presenter.state, PresentState::Verifying { .. }));
+
+        presenter.state = PresentState::Idle;
+        assert!(presenter.request_refresh());
+        assert!(!presenter.request(PresentReason::Foreground));
+        assert!(presenter.issue_due(&mut surface, &policy, false));
+        assert_eq!(screen.take_calls(), refresh_calls());
+
+        // The verification is a normal, non-flashing present.
+        clock.advance(VERIFY_DELAY);
+        presenter.poll_verification(clock.now());
+        assert!(presenter.issue_due(&mut surface, &policy, false));
+        assert_eq!(screen.take_calls(), present_calls());
+        assert!(matches!(presenter.state, PresentState::Idle));
+    }
+
+    #[test]
+    fn hide_drops_the_refresh_latch() {
+        let _latch = LATCH.lock().unwrap_or_else(|e| e.into_inner());
+        let mut presenter = Presenter::new(Clock::manual());
+        request_full_refresh();
+        assert!(full_refresh_requested());
+        presenter.hide();
+        assert!(!full_refresh_requested());
     }
 }

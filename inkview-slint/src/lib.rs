@@ -3,7 +3,8 @@
 //! the Slint window, its event loop, the render and the input mapping.
 
 pub use inkview_eink::{
-    EinkScreen, UPDATES_ENV, UpdateMode, UpdatePolicy, full_present_requested, request_full_present,
+    EinkScreen, UPDATES_ENV, UpdateMode, UpdatePolicy, full_present_requested,
+    full_refresh_requested, request_full_present, request_full_refresh,
 };
 
 use inkview::Event as InkEvent;

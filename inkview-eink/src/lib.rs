@@ -48,14 +48,16 @@ mod surface;
 
 pub use input::{PointerKind, content_pointer};
 pub use policy::{UPDATES_ENV, UpdateMode, UpdatePolicy};
-pub use present::{full_present_requested, request_full_present};
+pub use present::{
+    full_present_requested, full_refresh_requested, request_full_present, request_full_refresh,
+};
 pub use queue::{Disconnected, wait_events};
 pub use screen::EinkScreen;
 pub use surface::Rect;
 
 use clock::Clock;
 use damage::DamagePath;
-use present::{PresentReason, Presenter, take_full_present_request};
+use present::{PresentReason, Presenter, take_full_present_request, take_full_refresh_request};
 use surface::{Surface, fmt_rect};
 
 /// Wait for events when neither the UI nor the presenter has a deadline.
@@ -237,12 +239,12 @@ impl<S: EinkScreen> EinkPresenter<S> {
     /// Step 3: how long the backend waits for events. `ui_deadline` is the
     /// UI's next timer, `animating` whether the UI animates.
     ///
-    /// `Some(ZERO)` if the application requested a present, so a request
+    /// `Some(ZERO)` if the application requested a present or a refresh, so a request
     /// from a timer earlier in this iteration is not left waiting. `None` (do
     /// not block) while the UI animates. Else the earliest of `ui_deadline`
     /// and [`deadline`](Self::deadline), or [`IDLE_WAIT`] if neither is set.
     pub fn wait_delay(&self, ui_deadline: Option<Duration>, animating: bool) -> Option<Duration> {
-        if full_present_requested() {
+        if full_present_requested() || full_refresh_requested() {
             Some(Duration::ZERO)
         } else if animating {
             None
@@ -311,6 +313,12 @@ impl<S: EinkScreen> EinkPresenter<S> {
             // so the full present contains the screen that requested it
             // and the normal damage path does not race it.
             self.new_present |= self.presenter.request(PresentReason::App);
+            redraw = true;
+        }
+        if take_full_refresh_request() && self.presenter.is_visible() {
+            // The flashing refresh takes the place of the damage update of
+            // this frame, as a full present does.
+            self.new_present |= self.presenter.request_refresh();
             redraw = true;
         }
 
@@ -605,6 +613,47 @@ mod tests {
         clock.advance(MS(250));
         iterate(&mut eink, &[], None);
         assert!(screen.take_calls().is_empty());
+    }
+
+    #[test]
+    fn app_refresh_replaces_the_damage_update_and_is_not_verified() {
+        let _latch = LATCH.lock().unwrap_or_else(|e| e.into_inner());
+        let (clock, screen, mut eink) = setup();
+        settle(&clock, &screen, &mut eink);
+
+        // The app requests a refresh with a content change: the damage is
+        // held, and one flashing full update goes out in its place.
+        crate::present::request_full_refresh();
+        iterate(&mut eink, &[], Some(rect(0, 0, 80, 80)));
+        let mut refresh = present();
+        refresh[2] = Call::Update {
+            kind: UpdateKind::Full,
+            x: 0,
+            y: 0,
+            w: W as u32,
+            h: H as u32,
+        };
+        assert_eq!(screen.take_calls(), refresh);
+        assert!(!crate::present::full_refresh_requested());
+
+        // No verification present and no finalizer update follow.
+        screen.set_busy(false);
+        clock.advance(MS(400));
+        iterate(&mut eink, &[], None);
+        clock.advance(MS(2500));
+        iterate(&mut eink, &[], None);
+        assert!(screen.take_calls().is_empty());
+    }
+
+    #[test]
+    fn hidden_task_gets_no_refresh() {
+        let _latch = LATCH.lock().unwrap_or_else(|e| e.into_inner());
+        let (_clock, screen, mut eink) = setup();
+        iterate(&mut eink, &[InkEvent::Background { pid: 0 }], None);
+        crate::present::request_full_refresh();
+        iterate(&mut eink, &[], None);
+        assert!(screen.take_calls().is_empty());
+        assert!(!crate::present::full_refresh_requested());
     }
 
     #[test]
